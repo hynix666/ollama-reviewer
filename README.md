@@ -1,0 +1,192 @@
+# ollama-reviewer
+
+A local Ollama model as a **code reviewer assistant** for Claude Code. It advises;
+Claude decides. The model never edits files and never has final say.
+
+Pure Python standard library — no pip install, no dependencies, no network beyond
+your own Ollama server.
+
+## Install
+
+Already installed if you are reading this from `~/.claude/skills/ollama-reviewer/`.
+Otherwise copy the tree to `~/.claude/skills/ollama-reviewer/` and the four command
+files to `~/.claude/commands/`. Then verify:
+
+```bash
+python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
+```
+
+20 checks should pass. Add `--live` to also run real inference against a file with
+deliberately planted defects.
+
+## Commands
+
+| Slash command | What it does |
+|---|---|
+| `/ollama-review` | Review the uncommitted diff, a ref, or named files |
+| `/ollama-review-file` | Review specific paths |
+| `/ollama-adversarial` | Assume the design is wrong; attack the assumptions |
+| `/ollama-status` | Ollama health plus installed models |
+
+## CLI
+
+```bash
+S=~/.claude/skills/ollama-reviewer/scripts
+
+python $S/cli.py status                        # health + model list
+python $S/cli.py review                        # uncommitted diff
+python $S/cli.py review --staged               # staged only
+python $S/cli.py review --ref main             # main...HEAD
+python $S/cli.py review --file a.py b.py       # explicit files
+git diff | python $S/cli.py review --stdin     # piped diff or pasted code
+
+python $S/cli.py review --adversarial --file api.py
+python $S/cli.py review --focus security,tests --file api.py
+python $S/cli.py review --instructions "focus on the retry loop" --file api.py
+python $S/cli.py review --model gemma4:26b --temperature 0.2 --timeout 300
+python $S/cli.py review --json                 # machine-readable
+python $S/cli.py review --debug                # tracebacks and retry traces
+```
+
+Focus areas: `logic`, `security`, `performance`, `edge-cases`, `tests`, `design`.
+Bare model families work — `--model qwen3-coder` resolves to an installed tag.
+
+## Configuration
+
+`config.json` beside this README:
+
+```json
+{
+  "base_url": "http://127.0.0.1:11434",
+  "model": "qwen3-coder:30b",
+  "fallback_models": ["gemma4:26b"],
+  "temperature": 0.1,
+  "timeout_s": 180,
+  "max_file_chars": 60000,
+  "max_files": 25,
+  "allow_cloud_models": false
+}
+```
+
+Environment overrides: `OLLAMA_HOST`, `OLLAMA_REVIEW_MODEL`, `OLLAMA_REVIEW_TIMEOUT`.
+
+Cloud models (`*:cloud`) are refused unless `allow_cloud_models` is true. A bind
+address like `0.0.0.0` is rewritten to loopback for connecting, since `0.0.0.0` is
+not a valid destination on Windows.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | The review ran. Findings, or none, are both success. |
+| 2 | Input error — bad paths, empty diff, not a repository |
+| 3 | Ollama unavailable — server down, model missing, cloud blocked |
+| 4 | Timeout |
+| 5 | Internal error |
+
+**Findings never produce a non-zero exit.** The script reports; you judge.
+
+## Error playbook
+
+| What you see | Cause | Fix |
+|---|---|---|
+| `Cannot reach the Ollama server` | Not running or wrong port | `ollama serve`; check `OLLAMA_HOST` |
+| `did not respond to a health check` | Server hung or absent | Restart Ollama |
+| `None of the candidate models are installed` | Model not pulled | `ollama pull <model>` — the message lists what you do have |
+| `Ollama reports insufficient memory` | VRAM/RAM exhausted | `ollama ps`, `ollama stop <model>`, or use a smaller `--model` |
+| `Model is still loading` | Cold start | Retried automatically with backoff |
+| `Request exceeded the configured timeout` | Big input or slow model | Raise `--timeout`, fewer files, smaller model |
+| `Ollama returned HTTP 4xx/5xx` | Bad request or server fault | 404 usually means a wrong model name |
+| `returned non-JSON output` | Model emitted prose | Handled automatically by the parser tiers |
+| `The diff is empty` | Nothing changed | Use `--file` or `--ref` |
+| `Not a git repository` | Wrong directory | Use `--cwd` or `--file` |
+| `Skipped <path> (binary...)` | Non-text input | Expected; binaries are never sent |
+| `TRUNCATED` in output | File over `max_file_chars` | Raise the cap or review fewer files |
+| `some input may have been dropped` | Prompt filled the context window | Review fewer files at once; the finding set may be incomplete |
+
+Every error message names both the problem and the remedy. Nothing crashes the
+Claude session; failures render as a Markdown "review unavailable" section or, with
+`--json`, a structured `error` object.
+
+## How each error class is handled
+
+**Connectivity.** Health checks run on a short budget and classify a timeout as
+*unreachable* rather than *slow*, because a server that cannot answer `/api/tags` in
+five seconds is not there. Connection refused, DNS failure, and invalid bind
+addresses all resolve to the same actionable message.
+
+**Model availability.** Models are listed before any review runs, so a missing model
+fails in a second rather than after a long timeout. The error names your installed
+models. Without an explicit `--model`, the configured fallback chain is tried in order.
+
+**Transient failures.** OOM, model-loading, HTTP 5xx, timeouts, and malformed
+responses retry up to three times with exponential backoff. Non-transient errors —
+missing model, blocked cloud model, 4xx — fail immediately rather than burning the
+time budget.
+
+**Malformed output.** Three tiers: schema-constrained decoding; on failure a
+free-form retry with a tolerant parser that extracts fenced or embedded JSON; and
+finally the raw text surfaced as a single `info` finding with `status: partial`.
+Invalid severities and categories are normalised rather than rejected, so one bad
+enum never discards a whole review.
+
+**Input.** Missing paths, directories, binaries (by extension *and* null-byte probe),
+empty files, empty diffs, and non-repositories are each rejected with their own
+message. Oversized files are truncated with an explicit marker that tells the model
+not to speculate about the omitted part. Diffs split at file boundaries, never
+mid-function.
+
+**Context window.** `num_ctx` is computed from the actual prompt size rather than
+hardcoded, because Ollama silently discards anything beyond it — an undersized window
+means the model reviews part of a file while reporting as though it saw all of it. If
+the server reports it consumed nearly the whole window anyway, the review is marked
+`partial` with a warning rather than presented as complete.
+
+**Runtime.** A top-level handler converts any unexpected exception into a structured
+internal error; tracebacks appear only under `--debug`. Ctrl-C exits cleanly.
+Temporary files in the selftest are removed in `finally` blocks. All work is
+foreground and bounded by a shared deadline, so nothing can hang indefinitely or
+orphan a process.
+
+## Example workflow
+
+Claude has just implemented a token-refresh endpoint.
+
+**1. Implement first.** Claude writes the code and its tests. The reviewer is never
+asked what to build.
+
+**2. Review the diff.**
+
+```bash
+python ~/.claude/skills/ollama-reviewer/scripts/cli.py review --focus security,edge-cases
+```
+
+**3. Triage.** Suppose three findings come back:
+
+- *Refresh tokens are not rotated on use* — Claude checks: true, the handler reuses
+  the token. **Accepted.**
+- *Missing rate limiting* — real, but middleware already handles it two layers up.
+  **Rejected**, with the reason.
+- *Possible race on the token table* — Claude checks: the write is inside a
+  transaction with `SELECT ... FOR UPDATE`. **Rejected**, misread.
+
+**4. Apply only what survived.** Claude implements rotation. Nothing else changes.
+
+**5. Report.**
+
+> Local review (`qwen3-coder:30b`): 3 findings. Accepted 1 — refresh tokens weren't
+> rotated on use; fixed. Rejected 2 — rate limiting is handled in middleware, and
+> the race claim misses the `FOR UPDATE` lock.
+
+**When the reviewer is unavailable**, step 2 prints "review unavailable" with a
+remedy and exits 3. Claude reports one line — `Local review unavailable: Ollama is
+not running` — and continues. The work is not blocked, and Claude never claims the
+code was reviewed.
+
+## Limits, honestly
+
+Against a fixture with four planted defects, `qwen3-coder:30b` found the SQL
+injection, the unhandled `None`, and the off-by-one — and missed a
+`ZeroDivisionError` on an adjacent line. It sees only what it is sent: not your
+callers, tests, or invariants. A clean review is weak evidence, not proof, and never
+a substitute for tests.
