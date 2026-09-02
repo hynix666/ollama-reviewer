@@ -6,6 +6,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-777)
 ![Inference](https://img.shields.io/badge/inference-100%25%20local-ff6d00)
 ![Role](https://img.shields.io/badge/model%20role-advisory%20only-6f42c1)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
 A local Ollama model as a **code reviewer assistant** for Claude Code. It advises;
 Claude decides. The model never edits files and never has final say.
@@ -213,3 +214,7 @@ injection, the unhandled `None`, and the off-by-one — and missed a
 `ZeroDivisionError` on an adjacent line. It sees only what it is sent: not your
 callers, tests, or invariants. A clean review is weak evidence, not proof, and never
 a substitute for tests.
+
+## License
+
+[MIT](LICENSE) © 2026 hynix666
