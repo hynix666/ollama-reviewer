@@ -301,8 +301,12 @@ def from_files(cfg, paths, code_only=True):
     return _finalize("files", kept, cfg, warnings, skipped)
 
 
-def from_text(cfg, text, label="pasted-input", kind="pasted code"):
-    """Collect an in-memory string. Recognises a unified diff and splits it."""
+def from_text(cfg, text, label="pasted-input", kind="pasted code", code_only=True):
+    """Collect an in-memory string. Recognises a unified diff and splits it.
+
+    A piped diff gets the same prose filter as one read from git; a single
+    pasted snippet does not, since there is nothing to filter against.
+    """
     if not (text or "").strip():
         raise InputError(
             "No code was provided.", "Pass a non-empty string to review."
@@ -310,15 +314,17 @@ def from_text(cfg, text, label="pasted-input", kind="pasted code"):
     if text.lstrip().startswith("diff --git "):
         sections = split_diff_by_file(text)
         if sections:
-            return _finalize(kind + " (diff)", sections, cfg, [], [])
+            warnings, skipped = [], []
+            sections = apply_code_filter(sections, skipped, warnings, code_only)
+            return _finalize(kind + " (diff)", sections, cfg, warnings, skipped)
     return _finalize(kind, [(label, text)], cfg, [], [])
 
 
-def from_stdin(cfg):
+def from_stdin(cfg, code_only=True):
     """Collect pasted code or a piped diff from stdin."""
     if sys.stdin is None or sys.stdin.isatty():
         raise InputError(
             "--stdin was given but no data was piped in.",
             "Pipe content, e.g.: git diff | ollama-review review --stdin",
         )
-    return from_text(cfg, sys.stdin.read(), "pasted-input", "stdin")
+    return from_text(cfg, sys.stdin.read(), "pasted-input", "stdin", code_only)

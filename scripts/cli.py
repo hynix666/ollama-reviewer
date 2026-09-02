@@ -206,7 +206,7 @@ def cmd_review(args):
     try:
         code_only = not args.all_files
         if args.stdin:
-            inp = collect.from_stdin(cfg)
+            inp = collect.from_stdin(cfg, code_only=code_only)
         elif args.file:
             inp = collect.from_files(cfg, args.file, code_only=code_only)
         else:

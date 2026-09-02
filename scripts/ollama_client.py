@@ -261,10 +261,18 @@ def generate(
     trace = []
     last = None
 
+    # `timeout` is the budget for this call INCLUDING retries and backoff, not
+    # per attempt. Treating it per attempt let three retries overrun the caller's
+    # deadline threefold - measured at 532s against a 360s budget.
+    call_deadline = time.time() + timeout
+
     for attempt in range(1, attempts + 1):
         started = time.time()
+        remaining = call_deadline - started
+        if remaining <= 1:
+            raise last or _timeout_error("request")
         try:
-            data = _post(url, payload, timeout)
+            data = _post(url, payload, remaining)
             text = (data.get("response") or "").strip()
             if not text:
                 raise OllamaError(
@@ -298,6 +306,13 @@ def generate(
                 if debug:
                     e.detail = "%s | trace=%s" % (e.detail, json.dumps(trace))
                 raise
-            time.sleep(base**attempt)
+            # Never sleep past the caller's deadline, and do not start an
+            # attempt there is no time left to finish.
+            nap = min(base**attempt, max(0.0, call_deadline - time.time()))
+            if nap <= 0 or call_deadline - time.time() <= 1:
+                if debug:
+                    e.detail = "%s | trace=%s" % (e.detail, json.dumps(trace))
+                raise
+            time.sleep(nap)
 
     raise last

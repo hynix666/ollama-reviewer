@@ -1,7 +1,7 @@
 # Local Ollama Reviewer — Design
 
 **Date:** 2026-09-02
-**Status:** Implemented and verified (37/37 self-checks passing)
+**Status:** Implemented and verified (39/39 self-checks passing)
 **Location:** `~/.claude/skills/ollama-reviewer/`
 
 ---
@@ -289,7 +289,7 @@ respected exactly.
      +-- render.py         tolerant parsing + Markdown rendering
      +-- review.py         orchestration: models over chunks, result assembly
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       37 checks, all error paths
+     +-- selftest.py       39 checks, all error paths
      +-- consensus.py      cross-model reconciliation of findings
 ```
 
@@ -365,7 +365,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 37 checks, 34 of them with no inference required: configuration loading,
+`selftest.py` runs 39 checks, 36 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `--live` additionally reviews a fixture containing planted defects.

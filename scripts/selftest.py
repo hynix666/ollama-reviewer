@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -351,6 +352,68 @@ def t_review_options_decoupled():
     return "orchestration is argparse-free"
 
 
+def t_retries_respect_total_budget():
+    """The timeout is the budget for the whole call, retries included.
+
+    Regression guard: it was once applied per attempt, so three retries overran
+    the caller's deadline threefold - measured at 532s against a 360s budget.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class AlwaysFive(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b'{"error":"internal"}'
+            self.send_response(500)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), AlwaysFive)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        cfg, _ = cli.load_config()
+        cfg = dict(
+            cfg,
+            base_url="http://127.0.0.1:%d" % srv.server_address[1],
+            max_retries=3,
+            backoff_base_s=2.0,
+        )
+        budget = 4
+        started = time.time()
+        try:
+            oc.generate(cfg, "m", "sys", "usr", timeout=budget)
+        except oc.OllamaError as e:
+            assert e.kind in ("http_5xx", "timeout"), "unexpected kind %s" % e.kind
+        else:
+            raise AssertionError("expected the 500s to surface as an OllamaError")
+        elapsed = time.time() - started
+        assert elapsed < budget * 1.6, (
+            "overran the budget: %.1fs against %ds" % (elapsed, budget))
+        return "gave up in %.1fs within a %ds budget" % (elapsed, budget)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def t_stdin_diff_honours_code_filter():
+    cfg, _ = cli.load_config()
+    diff = (
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-x\n+y\n"
+    )
+    filtered = collect.from_text(cfg, diff, kind="stdin")
+    assert [c.label for c in filtered.chunks] == ["app.py"], (
+        "piped diff should drop prose, got %s" % [c.label for c in filtered.chunks])
+    everything = collect.from_text(cfg, diff, kind="stdin", code_only=False)
+    assert len(everything.chunks) == 2, "--all-files should keep the README"
+    return "piped diffs filter like git diffs"
+
+
 def t_code_filter_drops_prose():
     cfg, _ = cli.load_config()
     kept = [("README.md", "docs"), ("a.py", "code"), ("yarn.lock", "junk")]
@@ -568,6 +631,8 @@ def main():
         ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("modules stay focused", t_modules_stay_focused),
         ("orchestration decoupled", t_review_options_decoupled),
+        ("client: retries respect budget", t_retries_respect_total_budget),
+        ("collect: stdin diff filtered", t_stdin_diff_honours_code_filter),
         ("collect: code filter drops prose", t_code_filter_drops_prose),
         ("collect: filter yields if all prose", t_code_filter_yields_when_all_prose),
         ("collect: --all-files keeps prose", t_code_filter_off_keeps_everything),
