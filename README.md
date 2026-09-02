@@ -217,6 +217,14 @@ injection, the unhandled `None`, and the off-by-one — and missed a
 callers, tests, or invariants. A clean review is weak evidence, not proof, and never
 a substitute for tests.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability, and for what the
+tool does with your code: it is sent to whatever endpoint you configure (localhost
+by default, cloud models refused unless you enable them), secrets inside reviewed
+files are not redacted, and reviewer output should be treated as untrusted data
+when the code under review is untrusted.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: standard library only,
