@@ -42,8 +42,8 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 26 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 23 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 28 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 25 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
 ```
 
@@ -121,6 +121,7 @@ appear useful.
 | `scripts/ollama_client.py` | HTTP, error taxonomy, retries, context sizing |
 | `scripts/collect.py` | Input gathering and validation (git, files, stdin) |
 | `scripts/prompts.py` | System and user prompts, response schema |
+| `scripts/review.py` | Review orchestration: models over chunks, result assembly |
 | `scripts/consensus.py` | Cross-model reconciliation of findings |
 | `scripts/render.py` | Tolerant parsing and Markdown rendering |
 | `scripts/cli.py` | Orchestration, exit codes, exception barrier |
@@ -129,7 +130,8 @@ appear useful.
 | `docs/` | Design document, including rejected alternatives |
 
 Keep modules focused. If one grows past roughly 400 lines it is probably doing two
-jobs.
+jobs - `selftest.py` enforces this, so a breach fails the build rather than
+drifting. `selftest.py` itself is exempt; test files grow with coverage.
 
 ## Pull requests
 

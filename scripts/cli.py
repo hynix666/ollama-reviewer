@@ -15,16 +15,15 @@ import argparse
 import json
 import os
 import sys
-import time
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import collect  # noqa: E402
-import consensus  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
+import review  # noqa: E402
 
 CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json"
@@ -157,82 +156,16 @@ def cmd_status(args):
     return EXIT_OK
 
 
-def review_chunk(cfg, model, chunk, input_kind, focus, args, budget_s):
-    """Review one chunk through the three-tier degradation ladder.
-
-    Returns (findings, mode, meta). Raises OllamaError only if every tier fails.
-    """
-    system = prompts.build_system_prompt(args.adversarial)
-    user = prompts.build_user_prompt(
-        chunk.label,
-        chunk.text,
-        input_kind,
-        focus,
-        adversarial=args.adversarial,
-        extra_instructions=args.instructions,
-        truncated=chunk.truncated,
-    )
-
-    # Tier 1: schema-constrained decoding.
-    try:
-        text, meta = oc.generate(
-            cfg, model, system, user,
-            schema=prompts.RESPONSE_SCHEMA,
-            timeout=budget_s,
-            temperature=args.temperature,
-            debug=args.debug,
-        )
-        findings, mode = render.parse_findings(text)
-        if findings is not None:
-            return findings, mode, meta
-        tier1_text = text
-    except oc.OllamaError as e:
-        if e.kind in ("unreachable", "model_missing", "cloud_blocked", "timeout"):
-            raise
-        tier1_text = None
-
-    # Tier 2: unconstrained, tolerant parse. Some quantised models handle the
-    # free-form prompt better than constrained decoding.
-    text, meta = oc.generate(
-        cfg, model, system, user,
-        schema=None,
-        timeout=budget_s,
-        temperature=args.temperature,
-        debug=args.debug,
-    )
-    findings, mode = render.parse_findings(text)
-    if findings is not None:
-        meta["degraded"] = "schema-constrained output failed; used free-form parse"
-        return findings, mode, meta
-
-    # Tier 3: surface the raw text rather than losing the reviewer's thinking.
-    raw = (text or tier1_text or "").strip()
-    meta["degraded"] = "output was not parseable as JSON; surfaced as raw text"
-    return (
-        [
-            {
-                "severity": "info",
-                "category": "logic",
-                "location": chunk.label,
-                "issue": "Reviewer output could not be parsed as structured findings.",
-                "why": "The model did not return valid JSON after two attempts.",
-                "suggested_fix": "Raw reviewer output follows:\n\n%s" % raw[:4000],
-            }
-        ],
-        "raw",
-        meta,
-    )
-
-
 def cmd_review(args):
     cfg, notes = load_config()
     if args.timeout:
         cfg["timeout_s"] = args.timeout
 
+    # ---- validate focus ------------------------------------------------
     focus = prompts.DEFAULT_FOCUS
     if args.focus:
-        requested = [f.strip().lower() for f in args.focus.split(",") if f.strip()]
-        bad = [f for f in requested if f not in prompts.FOCUS_AREAS]
+        wanted = [f.strip().lower() for f in args.focus.split(",") if f.strip()]
+        bad = [f for f in wanted if f not in prompts.FOCUS_AREAS]
         if bad:
             return fail(
                 {
@@ -243,23 +176,11 @@ def cmd_review(args):
                 args.json,
                 notes,
             )
-        focus = requested
+        focus = wanted
     if args.adversarial and "design" not in focus:
         focus = focus + ["design"]
 
-    # ---- collect input -------------------------------------------------
-    try:
-        if args.stdin:
-            inp = collect.from_stdin(cfg)
-        elif args.file:
-            inp = collect.from_files(cfg, args.file)
-        else:
-            inp = collect.from_git(cfg, ref=args.ref, staged=args.staged, cwd=args.cwd)
-    except collect.InputError as e:
-        return fail(e.to_dict(), args.json, notes)
-
-    # ---- resolve model(s) ----------------------------------------------
-    requested = []
+    # ---- which models were asked for -----------------------------------
     if args.models:
         requested = [m.strip() for m in args.models.split(",") if m.strip()]
     elif args.consensus:
@@ -277,116 +198,36 @@ def cmd_review(args):
             )
     elif args.model:
         requested = [args.model]
+    else:
+        requested = []
+
+    # ---- collect input, resolve models, run -----------------------------
+    try:
+        if args.stdin:
+            inp = collect.from_stdin(cfg)
+        elif args.file:
+            inp = collect.from_files(cfg, args.file)
+        else:
+            inp = collect.from_git(cfg, ref=args.ref, staged=args.staged, cwd=args.cwd)
+    except collect.InputError as e:
+        return fail(e.to_dict(), args.json, notes)
 
     try:
-        installed = oc.list_models(cfg)
-        names = {m.get("name") for m in installed if m.get("name")}
-        if requested:
-            models = []
-            for want in requested:
-                resolved, rnotes = oc.resolve_model(cfg, want, names)
-                notes += rnotes
-                if resolved not in models:
-                    models.append(resolved)
-        else:
-            resolved, rnotes = oc.resolve_model(cfg, None, names)
-            notes += rnotes
-            models = [resolved]
+        models = review.resolve_models(cfg, requested, notes)
     except oc.OllamaError as e:
         return fail(e.to_dict(), args.json, notes)
 
-    if len(models) == 1 and len(requested) > 1:
-        notes.append(
-            "All requested models resolved to %s; consensus needs at least two "
-            "distinct models." % models[0]
-        )
+    opts = review.ReviewOptions(
+        adversarial=args.adversarial,
+        instructions=args.instructions,
+        temperature=args.temperature,
+        debug=args.debug,
+    )
+    try:
+        result = review.run_review(cfg, models, inp, focus, opts, notes)
+    except review.ReviewFailure as e:
+        return fail(e.error, args.json, notes)
 
-    # ---- review each chunk under a shared deadline ---------------------
-    started = time.time()
-    deadline = started + cfg["timeout_s"]
-    per_model = [(m, []) for m in models]
-    by_model = dict((m, fs) for m, fs in per_model)
-    active = list(models)
-    chunk_errors = []
-    degraded = []
-
-    for chunk in inp.chunks:
-        for model in list(active):
-            remaining = deadline - time.time()
-            if remaining <= 5:
-                chunk_errors.append(
-                    {
-                        "label": chunk.label,
-                        "model": model,
-                        "error": {
-                            "kind": "timeout",
-                            "detail": "Overall time budget exhausted before this chunk.",
-                            "remedy": "Raise --timeout or review fewer files at once."
-                            + (
-                                " Reviewing with %d models multiplies the work."
-                                % len(models)
-                                if len(models) > 1
-                                else ""
-                            ),
-                        },
-                    }
-                )
-                continue
-            try:
-                got, mode, meta = review_chunk(
-                    cfg, model, chunk, inp.kind, focus, args, remaining
-                )
-                for f in got:
-                    if f["location"] in ("unspecified", "") or "/" not in f["location"]:
-                        f["location"] = "%s: %s" % (chunk.label, f["location"])
-                by_model[model] += got
-                for key, msg in (
-                    ("degraded", None),
-                    ("output_truncated", "model output hit the length limit"),
-                    ("input_possibly_truncated", None),
-                ):
-                    if meta.get(key):
-                        text = msg or meta[key]
-                        degraded.append("%s (%s): %s" % (chunk.label, model, text))
-            except oc.OllamaError as e:
-                chunk_errors.append(
-                    {"label": chunk.label, "model": model, "error": e.to_dict()}
-                )
-                # A dead model drops out of the rest of the run; the others carry on.
-                if e.kind in ("unreachable", "model_missing", "cloud_blocked"):
-                    active.remove(model)
-                    notes.append(
-                        "Dropped %s after a fatal error: %s" % (model, e.detail)
-                    )
-        if not active:
-            break
-
-    total = sum(len(fs) for fs in by_model.values())
-    if not total and chunk_errors and not active:
-        return fail(chunk_errors[0]["error"], args.json, notes)
-
-    if len(models) > 1:
-        merged = consensus.sort_merged(consensus.reconcile(per_model))
-        agreement = consensus.summarize(per_model, merged)
-    else:
-        merged = by_model[models[0]]
-        agreement = None
-
-    status = "partial" if (chunk_errors or degraded) else "ok"
-    result = {
-        "status": status,
-        "model": models[0] if len(models) == 1 else None,
-        "models": models,
-        "agreement": agreement,
-        "adversarial": bool(args.adversarial),
-        "focus": focus,
-        "elapsed_s": round(time.time() - started, 2),
-        "input": inp.summary(),
-        "findings": merged,
-        "chunk_errors": chunk_errors,
-        "notes": notes + degraded,
-        "error": None,
-    }
     emit(result, args.json)
     return EXIT_OK
 

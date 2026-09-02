@@ -20,6 +20,7 @@ import collect  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
+import review  # noqa: E402
 
 PLANTED_DEFECTS = '''\
 import sqlite3
@@ -319,6 +320,36 @@ def t_consensus_parses_messy_locations():
     return "handles paths, line numbers and prose"
 
 
+def t_modules_stay_focused():
+    """CONTRIBUTING promises modules stay near 400 lines; enforce it.
+
+    selftest.py is exempt: test files grow with coverage, and splitting them
+    buys nothing. cli.py already breached this once, which is why it exists.
+    """
+    limit = 400
+    here = os.path.dirname(os.path.abspath(__file__))
+    oversized = []
+    for name in sorted(os.listdir(here)):
+        if not name.endswith(".py") or name == "selftest.py":
+            continue
+        with open(os.path.join(here, name), encoding="utf-8") as fh:
+            n = sum(1 for _ in fh)
+        if n > limit:
+            oversized.append("%s (%d)" % (name, n))
+    assert not oversized, "over %d lines: %s" % (limit, ", ".join(oversized))
+    return "all tool modules within %d lines" % limit
+
+
+def t_review_options_decoupled():
+    """run_review must not need argparse types."""
+    opts = review.ReviewOptions(adversarial=True, instructions="focus on retries")
+    assert opts.adversarial and opts.temperature is None
+    assert not hasattr(opts, "json"), "ReviewOptions should not carry CLI concerns"
+    err = review.ReviewFailure({"kind": "timeout", "detail": "d", "remedy": "r"})
+    assert err.error["kind"] == "timeout"
+    return "orchestration is argparse-free"
+
+
 def t_render_never_crashes():
     md = render.to_markdown({"status": "error", "error": {"detail": "d", "remedy": "r"}})
     assert "unavailable" in md.lower()
@@ -415,6 +446,8 @@ def main():
         ("consensus: corroborated first", t_consensus_sorts_corroborated_first),
         ("consensus: severity spread", t_consensus_severity_spread),
         ("consensus: messy locations", t_consensus_parses_messy_locations),
+        ("modules stay focused", t_modules_stay_focused),
+        ("orchestration decoupled", t_review_options_decoupled),
         ("render never crashes", t_render_never_crashes),
         ("prompts well-formed", t_prompt_shape),
     ]
