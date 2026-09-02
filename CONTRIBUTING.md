@@ -42,8 +42,8 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 28 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 25 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 32 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 29 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
 ```
 
@@ -122,6 +122,7 @@ appear useful.
 | `scripts/collect.py` | Input gathering and validation (git, files, stdin) |
 | `scripts/prompts.py` | System and user prompts, response schema |
 | `scripts/review.py` | Review orchestration: models over chunks, result assembly |
+| `scripts/mcp_server.py` | MCP stdio server (JSON-RPC 2.0, no SDK dependency) |
 | `scripts/consensus.py` | Cross-model reconciliation of findings |
 | `scripts/render.py` | Tolerant parsing and Markdown rendering |
 | `scripts/cli.py` | Orchestration, exit codes, exception barrier |

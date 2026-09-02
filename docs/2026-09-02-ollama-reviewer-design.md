@@ -1,7 +1,7 @@
 # Local Ollama Reviewer — Design
 
 **Date:** 2026-09-02
-**Status:** Implemented and verified (28/28 self-checks passing)
+**Status:** Implemented and verified (32/32 self-checks passing)
 **Location:** `~/.claude/skills/ollama-reviewer/`
 
 ---
@@ -218,6 +218,38 @@ paired qwen3-coder with gemma4 and produced zero corroboration by construction;
 it was replaced with gpt-oss after measurement. Prefer models from different
 families, so their errors are less correlated.
 
+### D12 — MCP server as a second front end, not a replacement
+
+D1 rejected MCP as the *primary* interface because it needs a client restart
+before its tools register, which would have left the tool unusable while it was
+being built. That objection was about sequencing, not about MCP, so the server
+now exists alongside the CLI rather than instead of it.
+
+It speaks JSON-RPC 2.0 over stdio directly. The official MCP SDK is a PyPI
+package, and the zero-dependency rule is worth more here than the few hundred
+lines it would save: the surface actually required is `initialize`,
+`tools/list`, `tools/call` and `ping`.
+
+Four tools — `ollama_review_file`, `ollama_review_code`, `ollama_review_diff`,
+`ollama_list_models`. The first three names come from the protocol that
+originally motivated the project.
+
+The refactor in the previous change is what made this cheap. Because
+`review.run_review` takes a `ReviewOptions` rather than an argparse `Namespace`
+and returns a dict rather than printing, the server calls the engine in-process
+and formats the return value. Had the orchestration still lived inside
+`cmd_review`, this adapter would have had to shell out and parse its own CLI's
+output.
+
+**The stdout discipline is the sharp edge.** A stdio MCP server may emit nothing
+but JSON-RPC frames; one stray `print` corrupts the stream and the client
+disconnects. Diagnostics therefore go to stderr, and a selftest check drives the
+protocol directly to keep that honest.
+
+Tool descriptions repeat that findings are advisory and must be verified — a
+check enforces this, because an MCP client sees only the description, never
+`SKILL.md`, and the role separation must survive that context loss.
+
 ## 5. Architecture
 
 ```
@@ -234,7 +266,8 @@ families, so their errors are less correlated.
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
      +-- render.py         tolerant parsing + Markdown rendering
      +-- review.py         orchestration: models over chunks, result assembly
-     +-- selftest.py       28 checks, all error paths
+     +-- mcp_server.py     MCP stdio server over the same engine
+     +-- selftest.py       32 checks, all error paths
      +-- consensus.py      cross-model reconciliation of findings
 ```
 
@@ -310,7 +343,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 28 checks, 25 of them with no inference required: configuration loading,
+`selftest.py` runs 32 checks, 29 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `--live` additionally reviews a fixture containing planted defects.
@@ -348,9 +381,7 @@ labels carry no authority.** This is why §3's reporting requirement exists.
 
 ## 11. Future work
 
-- **MCP wrapper.** The engine already emits JSON; exposing `ollama_review_code` and
-  `ollama_review_file` over MCP is a thin adapter if native tool calls become
-  preferable to Bash invocation.
+- **MCP wrapper.** Implemented — see D12. The CLI remains primary.
 - **Background mode.** Cut in D8. The seams (chunk labels, shared deadline) would
   accommodate it without rework should long reviews become common.
 - **Multi-model consensus.** Implemented — see D11, which reverses this section's

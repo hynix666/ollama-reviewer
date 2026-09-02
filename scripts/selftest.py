@@ -20,6 +20,7 @@ import collect  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
+import mcp_server  # noqa: E402
 import review  # noqa: E402
 
 PLANTED_DEFECTS = '''\
@@ -350,6 +351,57 @@ def t_review_options_decoupled():
     return "orchestration is argparse-free"
 
 
+def t_mcp_handshake():
+    init = mcp_server.dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05"}}
+    )
+    assert init["result"]["serverInfo"]["name"] == "ollama-reviewer"
+    assert init["result"]["capabilities"]["tools"] is not None
+    listed = mcp_server.dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    names = [t["name"] for t in listed["result"]["tools"]]
+    for want in ("ollama_review_file", "ollama_review_code", "ollama_list_models"):
+        assert want in names, "missing tool %s" % want
+    assert mcp_server.dispatch({"jsonrpc": "2.0", "id": 3, "method": "ping"})["result"] == {}
+    return "%d tools advertised" % len(names)
+
+
+def t_mcp_protocol_errors():
+    bad = mcp_server.dispatch({"jsonrpc": "2.0", "id": 9, "method": "no/such"})
+    assert bad["error"]["code"] == -32601, "unknown method must be -32601"
+    missing = mcp_server.dispatch(
+        {"jsonrpc": "2.0", "id": 10, "method": "tools/call", "params": {}}
+    )
+    assert missing["error"]["code"] == -32602, "missing tool name must be -32602"
+    note = mcp_server.dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert note is None, "notifications must not get a response"
+    return "-32601, -32602, notifications silent"
+
+
+def t_mcp_tool_schemas():
+    for t in mcp_server.TOOLS:
+        assert t["name"] and t["description"], "tool missing name or description"
+        schema = t["inputSchema"]
+        assert schema["type"] == "object"
+        for req in schema.get("required", []):
+            assert req in schema["properties"], "%s requires undeclared %s" % (
+                t["name"], req)
+    reviewers = [t for t in mcp_server.TOOLS if t["name"].startswith("ollama_review")]
+    assert reviewers, "no review tools"
+    for t in reviewers:
+        low = t["description"].lower()
+        assert "verif" in low or "advisory" in low, (
+            "%s must tell callers findings need verifying" % t["name"])
+    return "%d schemas valid, advisory framing present" % len(mcp_server.TOOLS)
+
+
+def t_mcp_unknown_tool_is_error():
+    out = mcp_server.call_tool("not_a_tool", {})
+    assert out["isError"] is True
+    assert "Unknown tool" in out["content"][0]["text"]
+    return "unknown tool -> isError, not an exception"
+
+
 def t_render_never_crashes():
     md = render.to_markdown({"status": "error", "error": {"detail": "d", "remedy": "r"}})
     assert "unavailable" in md.lower()
@@ -448,6 +500,10 @@ def main():
         ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("modules stay focused", t_modules_stay_focused),
         ("orchestration decoupled", t_review_options_decoupled),
+        ("mcp: handshake + tools", t_mcp_handshake),
+        ("mcp: protocol errors", t_mcp_protocol_errors),
+        ("mcp: tool schemas", t_mcp_tool_schemas),
+        ("mcp: unknown tool", t_mcp_unknown_tool_is_error),
         ("render never crashes", t_render_never_crashes),
         ("prompts well-formed", t_prompt_shape),
     ]

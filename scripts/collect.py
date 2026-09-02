@@ -257,6 +257,19 @@ def from_files(cfg, paths):
     return _finalize("files", kept, cfg, [], skipped)
 
 
+def from_text(cfg, text, label="pasted-input", kind="pasted code"):
+    """Collect an in-memory string. Recognises a unified diff and splits it."""
+    if not (text or "").strip():
+        raise InputError(
+            "No code was provided.", "Pass a non-empty string to review."
+        )
+    if text.lstrip().startswith("diff --git "):
+        sections = split_diff_by_file(text)
+        if sections:
+            return _finalize(kind + " (diff)", sections, cfg, [], [])
+    return _finalize(kind, [(label, text)], cfg, [], [])
+
+
 def from_stdin(cfg):
     """Collect pasted code or a piped diff from stdin."""
     if sys.stdin is None or sys.stdin.isatty():
@@ -264,11 +277,4 @@ def from_stdin(cfg):
             "--stdin was given but no data was piped in.",
             "Pipe content, e.g.: git diff | ollama-review review --stdin",
         )
-    text = sys.stdin.read()
-    if not text.strip():
-        raise InputError("stdin was empty.", "Pipe non-empty content and retry.")
-    if text.lstrip().startswith("diff --git "):
-        sections = split_diff_by_file(text)
-        if sections:
-            return _finalize("stdin-diff", sections, cfg, [], [])
-    return _finalize("stdin", [("pasted-input", text)], cfg, [], [])
+    return from_text(cfg, sys.stdin.read(), "pasted-input", "stdin")

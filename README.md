@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-28 checks should pass (25 without a running Ollama server). Add `--live` to also run real inference against a file with
+32 checks should pass (29 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.
@@ -102,6 +102,34 @@ Environment overrides: `OLLAMA_HOST`, `OLLAMA_REVIEW_MODEL`, `OLLAMA_REVIEW_TIME
 Cloud models (`*:cloud`) are refused unless `allow_cloud_models` is true. A bind
 address like `0.0.0.0` is rewritten to loopback for connecting, since `0.0.0.0` is
 not a valid destination on Windows.
+
+## MCP server
+
+The same engine is also exposed over MCP, for clients that prefer native tool
+calls to shelling out. Register it in `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "ollama-reviewer": {
+      "command": "python",
+      "args": ["<abs path>/skills/ollama-reviewer/scripts/mcp_server.py"]
+    }
+  }
+}
+```
+
+Restart the client, and four tools appear: `ollama_review_file`,
+`ollama_review_code`, `ollama_review_diff`, and `ollama_list_models`. Each
+accepts `focus`, `adversarial`, `instructions`, `models` and `format`.
+
+It speaks JSON-RPC 2.0 over stdio with no SDK dependency — the protocol surface
+needed is small enough that adding a PyPI package to get it would cost more than
+it saves. **Nothing but JSON-RPC frames may reach stdout**; diagnostics go to
+stderr, since a stray print corrupts the stream and disconnects the client.
+
+The CLI remains the primary interface: it works without a client restart and is
+debuggable from a terminal.
 
 ## Multi-model consensus
 
