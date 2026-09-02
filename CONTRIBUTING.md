@@ -140,6 +140,12 @@ jobs.
 - Update `README.md` and `docs/` when behaviour changes. Documentation drift is
   treated as a defect.
 
+## Code of conduct
+
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
+Reports go through GitHub's private reporting form, since this project publishes
+no contact email.
+
 ## Reporting bugs
 
 Include the output of:
