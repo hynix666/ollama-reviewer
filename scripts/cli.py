@@ -158,7 +158,8 @@ def cmd_status(args):
 
 def cmd_review(args):
     cfg, notes = load_config()
-    if args.timeout:
+    explicit_timeout = bool(args.timeout)
+    if explicit_timeout:
         cfg["timeout_s"] = args.timeout
 
     # ---- validate focus ------------------------------------------------
@@ -203,12 +204,16 @@ def cmd_review(args):
 
     # ---- collect input, resolve models, run -----------------------------
     try:
+        code_only = not args.all_files
         if args.stdin:
             inp = collect.from_stdin(cfg)
         elif args.file:
-            inp = collect.from_files(cfg, args.file)
+            inp = collect.from_files(cfg, args.file, code_only=code_only)
         else:
-            inp = collect.from_git(cfg, ref=args.ref, staged=args.staged, cwd=args.cwd)
+            inp = collect.from_git(
+                cfg, ref=args.ref, staged=args.staged, cwd=args.cwd,
+                code_only=code_only,
+            )
     except collect.InputError as e:
         return fail(e.to_dict(), args.json, notes)
 
@@ -216,6 +221,15 @@ def cmd_review(args):
         models = review.resolve_models(cfg, requested, notes)
     except oc.OllamaError as e:
         return fail(e.to_dict(), args.json, notes)
+
+    # Each extra model re-reviews every chunk, so a budget sized for one model
+    # silently starves the later files. Scale it unless the user set one.
+    if not explicit_timeout and len(models) > 1:
+        cfg["timeout_s"] *= len(models)
+        notes.append(
+            "Timeout scaled to %ds for %d models; pass --timeout to override."
+            % (cfg["timeout_s"], len(models))
+        )
 
     opts = review.ReviewOptions(
         adversarial=args.adversarial,
@@ -269,6 +283,12 @@ def build_parser():
     src.add_argument("--stdin", action="store_true", help="review piped input")
     src.add_argument("--cwd", default=".", help="repository directory")
     rv.add_argument("--focus", help="comma-separated: %s" % ",".join(prompts.FOCUS_AREAS))
+    rv.add_argument(
+        "--all-files",
+        action="store_true",
+        help="also review prose and lockfiles; by default Markdown, text and "
+        "lockfiles are skipped so the time budget goes to code",
+    )
     rv.add_argument("--adversarial", action="store_true", help="adversarial design critique")
     rv.add_argument("--instructions", help="extra steering, e.g. 'focus on the retry loop'")
     rv.add_argument("--model", help="override the review model")

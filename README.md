@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-34 checks should pass (31 without a running Ollama server). Add `--live` to also run real inference against a file with
+37 checks should pass (34 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.
@@ -72,11 +72,21 @@ python $S/cli.py review --instructions "focus on the retry loop" --file api.py
 python $S/cli.py review --models qwen3-coder:30b,gpt-oss:20b   # cross-check
 python $S/cli.py review --consensus                            # models from config
 python $S/cli.py review --model gpt-oss:20b --temperature 0.2 --timeout 300
+python $S/cli.py review --all-files            # include Markdown and lockfiles
 python $S/cli.py review --json                 # machine-readable
 python $S/cli.py review --debug                # tracebacks and retry traces
 ```
 
 Focus areas: `logic`, `security`, `performance`, `edge-cases`, `tests`, `design`.
+
+**Markdown, plain text and lockfiles are skipped by default.** The prompt is
+code-specific, so a model call spent on a README returns little and, on a shared
+deadline, costs a real file its turn. Skips are listed by name in the output.
+`--all-files` includes them; a diff containing nothing but prose reviews the
+prose rather than failing.
+
+**The timeout scales with the model count.** Two models get twice the budget,
+since each re-reviews every chunk. An explicit `--timeout` is never overridden.
 Bare model families work — `--model qwen3-coder` resolves to an installed tag.
 
 ## Configuration

@@ -351,6 +351,35 @@ def t_review_options_decoupled():
     return "orchestration is argparse-free"
 
 
+def t_code_filter_drops_prose():
+    cfg, _ = cli.load_config()
+    kept = [("README.md", "docs"), ("a.py", "code"), ("yarn.lock", "junk")]
+    skipped, warnings = [], []
+    out = collect.apply_code_filter(list(kept), skipped, warnings, True)
+    assert [l for l, _ in out] == ["a.py"], "kept %s" % [l for l, _ in out]
+    assert len(skipped) == 2, "both prose files should be reported as skipped"
+    assert all("--all-files" in s["reason"] for s in skipped), "reason must name the escape hatch"
+    return "prose and lockfiles dropped, and reported"
+
+
+def t_code_filter_yields_when_all_prose():
+    """An all-docs diff must review the docs, not fail with nothing to do."""
+    kept = [("README.md", "docs"), ("CHANGES.rst", "more docs")]
+    skipped, warnings = [], []
+    out = collect.apply_code_filter(list(kept), skipped, warnings, True)
+    assert len(out) == 2, "filter should yield rather than empty the set"
+    assert not skipped and warnings, "should warn, not silently skip"
+    return "yields rather than leaving nothing"
+
+
+def t_code_filter_off_keeps_everything():
+    kept = [("README.md", "docs"), ("a.py", "code")]
+    skipped = []
+    out = collect.apply_code_filter(list(kept), skipped, [], False)
+    assert len(out) == 2 and not skipped
+    return "--all-files keeps prose"
+
+
 def t_from_text_variants():
     """from_text shipped without coverage; the reviewer noticed, correctly."""
     cfg, _ = cli.load_config()
@@ -539,6 +568,9 @@ def main():
         ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("modules stay focused", t_modules_stay_focused),
         ("orchestration decoupled", t_review_options_decoupled),
+        ("collect: code filter drops prose", t_code_filter_drops_prose),
+        ("collect: filter yields if all prose", t_code_filter_yields_when_all_prose),
+        ("collect: --all-files keeps prose", t_code_filter_off_keeps_everything),
         ("collect: from_text variants", t_from_text_variants),
         ("mcp: broken pipe exits clean", t_serve_survives_closed_stdout),
         ("mcp: handshake + tools", t_mcp_handshake),

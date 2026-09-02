@@ -17,6 +17,47 @@ BINARY_EXTS = {
 }
 
 
+# Prose and generated lockfiles. The reviewer's prompt is code-specific, so
+# spending a model call on a README returns little and, on a shared deadline,
+# costs a real file its turn.
+PROSE_EXTS = {".md", ".markdown", ".rst", ".txt", ".adoc", ".org", ".tex"}
+LOCKFILES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "cargo.lock", "composer.lock", "gemfile.lock", "go.sum", "uv.lock",
+}
+
+
+def is_prose(path):
+    base = os.path.basename(path.replace("\\", "/")).lower()
+    return os.path.splitext(base)[1] in PROSE_EXTS or base in LOCKFILES
+
+
+def apply_code_filter(kept, skipped, warnings, code_only):
+    """Drop prose and lockfiles, unless that would leave nothing to review.
+
+    Returning an empty set would turn "your diff is all docs" into an error,
+    which is worse than just reviewing the docs. So the filter yields rather
+    than blocks, and says so.
+    """
+    if not code_only:
+        return kept
+    code = [(label, text) for label, text in kept if not is_prose(label)]
+    if not code:
+        if kept:
+            warnings.append(
+                "Nothing but prose or lockfiles here, so those were reviewed "
+                "anyway; the code-only filter yields rather than leaving you "
+                "with nothing."
+            )
+        return kept
+    for label, _ in kept:
+        if is_prose(label):
+            skipped.append(
+                {"path": label, "reason": "prose or lockfile; --all-files includes it"}
+            )
+    return code
+
+
 class InputError(Exception):
     def __init__(self, detail, remedy):
         super().__init__(detail)
@@ -170,7 +211,7 @@ def _finalize(kind, raw_chunks, cfg, warnings, skipped):
     return InputSet(kind, chunks, warnings, skipped)
 
 
-def from_git(cfg, ref=None, staged=False, cwd="."):
+def from_git(cfg, ref=None, staged=False, cwd=".", code_only=True):
     """Collect a diff: explicit ref, staged changes, or all uncommitted work."""
     warnings = []
     if ref:
@@ -213,10 +254,11 @@ def from_git(cfg, ref=None, staged=False, cwd="."):
             "The diff contains only binary files.",
             "Nothing textual to review. Use --file to point at source directly.",
         )
+    kept = apply_code_filter(kept, skipped, warnings, code_only)
     return _finalize(kind, kept, cfg, warnings, skipped)
 
 
-def from_files(cfg, paths):
+def from_files(cfg, paths, code_only=True):
     """Collect explicit file paths, rejecting missing, binary, and empty files."""
     kept = []
     skipped = []
@@ -254,7 +296,9 @@ def from_files(cfg, paths):
             "%s (%s)" % (s["path"], s["reason"]) for s in skipped[:10]
         )
         raise InputError(detail, "Check the paths and that they are text source files.")
-    return _finalize("files", kept, cfg, [], skipped)
+    warnings = []
+    kept = apply_code_filter(kept, skipped, warnings, code_only)
+    return _finalize("files", kept, cfg, warnings, skipped)
 
 
 def from_text(cfg, text, label="pasted-input", kind="pasted code"):

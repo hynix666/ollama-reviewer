@@ -1,7 +1,7 @@
 # Local Ollama Reviewer — Design
 
 **Date:** 2026-09-02
-**Status:** Implemented and verified (34/34 self-checks passing)
+**Status:** Implemented and verified (37/37 self-checks passing)
 **Location:** `~/.claude/skills/ollama-reviewer/`
 
 ---
@@ -250,6 +250,28 @@ Tool descriptions repeat that findings are advisory and must be verified — a
 check enforces this, because an MCP client sees only the description, never
 `SKILL.md`, and the role separation must survive that context loss.
 
+### D13 — Prose skipped by default; the deadline scales with model count
+
+Both changes come from running the tool on a real diff of this repository rather
+than on the fixture.
+
+Three of six chunks were Markdown. The reviewer spent roughly half a shared
+deadline analysing documentation with a prompt that asks for logic, security and
+performance defects, and `selftest.py` was never reviewed by either model
+because the budget ran out first.
+
+Markdown, plain text and lockfiles are therefore skipped by default rather than
+behind an opt-in flag: the run that exposed the problem would not have set an
+opt-in flag, because the waste was invisible until measured. Skipped files are
+listed by name in the output, so the filter is visible rather than silent, and
+`--all-files` restores the old behaviour. A diff containing nothing but prose
+reviews the prose instead of failing — the filter yields rather than blocking.
+
+Separately, the default 180s budget was sized for one model but shared across
+all of them, so consensus starved the later files. It now multiplies by the
+model count unless the user passed `--timeout`, in which case their number is
+respected exactly.
+
 ## 5. Architecture
 
 ```
@@ -267,7 +289,7 @@ check enforces this, because an MCP client sees only the description, never
      +-- render.py         tolerant parsing + Markdown rendering
      +-- review.py         orchestration: models over chunks, result assembly
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       34 checks, all error paths
+     +-- selftest.py       37 checks, all error paths
      +-- consensus.py      cross-model reconciliation of findings
 ```
 
@@ -343,7 +365,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 34 checks, 31 of them with no inference required: configuration loading,
+`selftest.py` runs 37 checks, 34 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `--live` additionally reviews a fixture containing planted defects.
