@@ -351,6 +351,45 @@ def t_review_options_decoupled():
     return "orchestration is argparse-free"
 
 
+def t_from_text_variants():
+    """from_text shipped without coverage; the reviewer noticed, correctly."""
+    cfg, _ = cli.load_config()
+
+    plain = collect.from_text(cfg, "x = 1\n", "snippet.py")
+    assert plain.chunks[0].label == "snippet.py"
+    assert "(diff)" not in plain.kind
+
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    parsed = collect.from_text(cfg, diff, "ignored", "stdin")
+    assert parsed.kind == "stdin (diff)", "diff kind was %r" % parsed.kind
+    assert parsed.chunks[0].label == "a.py", "diff should split by file"
+
+    for empty in ("", "   \n\t "):
+        try:
+            collect.from_text(cfg, empty)
+        except collect.InputError:
+            pass
+        else:
+            raise AssertionError("empty input %r should raise InputError" % empty)
+    return "plain, diff and empty inputs all handled"
+
+
+def t_serve_survives_closed_stdout():
+    """A client disconnecting mid-write must not produce a traceback."""
+
+    class ClosedPipe:
+        def write(self, _):
+            raise BrokenPipeError(32, "broken pipe")
+
+        def flush(self):
+            pass
+
+    request = '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+    rc = mcp_server.serve(stdin=iter([request]), stdout=ClosedPipe())
+    assert rc == 0, "expected a clean exit, got %r" % rc
+    return "broken pipe exits cleanly"
+
+
 def t_mcp_handshake():
     init = mcp_server.dispatch(
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -500,6 +539,8 @@ def main():
         ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("modules stay focused", t_modules_stay_focused),
         ("orchestration decoupled", t_review_options_decoupled),
+        ("collect: from_text variants", t_from_text_variants),
+        ("mcp: broken pipe exits clean", t_serve_survives_closed_stdout),
         ("mcp: handshake + tools", t_mcp_handshake),
         ("mcp: protocol errors", t_mcp_protocol_errors),
         ("mcp: tool schemas", t_mcp_tool_schemas),

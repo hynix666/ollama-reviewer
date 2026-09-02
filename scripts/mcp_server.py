@@ -319,8 +319,13 @@ def serve(stdin=None, stdout=None):
                 }
         if out is None:
             continue
-        stdout.write(json.dumps(out) + "\n")
-        stdout.flush()
+        try:
+            stdout.write(json.dumps(out) + "\n")
+            stdout.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            # The client went away mid-write. That is a normal shutdown, not a
+            # fault: exit quietly rather than dumping a traceback.
+            return 0
     return 0
 
 
