@@ -1,10 +1,19 @@
 # ollama-reviewer
 
+![Python](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-2ea44f)
+![Self-tests](https://img.shields.io/badge/self--tests-20%20passing-2ea44f)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-777)
+![Inference](https://img.shields.io/badge/inference-100%25%20local-ff6d00)
+![Role](https://img.shields.io/badge/model%20role-advisory%20only-6f42c1)
+
 A local Ollama model as a **code reviewer assistant** for Claude Code. It advises;
 Claude decides. The model never edits files and never has final say.
 
 Pure Python standard library — no pip install, no dependencies, no network beyond
 your own Ollama server.
+
+Tested on Python 3.14; uses no standard-library API newer than 3.7.
 
 ## Install
 
