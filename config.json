@@ -2,6 +2,7 @@
   "base_url": "http://127.0.0.1:11434",
   "model": "qwen3-coder:30b",
   "fallback_models": ["gemma4:26b"],
+  "consensus_models": ["qwen3-coder:30b", "gpt-oss:20b"],
   "temperature": 0.1,
   "timeout_s": 180,
   "connect_timeout_s": 5,

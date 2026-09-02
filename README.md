@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-20 checks should pass. Add `--live` to also run real inference against a file with
+26 checks should pass (23 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.
@@ -69,7 +69,9 @@ git diff | python $S/cli.py review --stdin     # piped diff or pasted code
 python $S/cli.py review --adversarial --file api.py
 python $S/cli.py review --focus security,tests --file api.py
 python $S/cli.py review --instructions "focus on the retry loop" --file api.py
-python $S/cli.py review --model gemma4:26b --temperature 0.2 --timeout 300
+python $S/cli.py review --models qwen3-coder:30b,gpt-oss:20b   # cross-check
+python $S/cli.py review --consensus                            # models from config
+python $S/cli.py review --model gpt-oss:20b --temperature 0.2 --timeout 300
 python $S/cli.py review --json                 # machine-readable
 python $S/cli.py review --debug                # tracebacks and retry traces
 ```
@@ -86,6 +88,7 @@ Bare model families work — `--model qwen3-coder` resolves to an installed tag.
   "base_url": "http://127.0.0.1:11434",
   "model": "qwen3-coder:30b",
   "fallback_models": ["gemma4:26b"],
+  "consensus_models": ["qwen3-coder:30b", "gpt-oss:20b"],
   "temperature": 0.1,
   "timeout_s": 180,
   "max_file_chars": 60000,
@@ -99,6 +102,33 @@ Environment overrides: `OLLAMA_HOST`, `OLLAMA_REVIEW_MODEL`, `OLLAMA_REVIEW_TIME
 Cloud models (`*:cloud`) are refused unless `allow_cloud_models` is true. A bind
 address like `0.0.0.0` is rewritten to loopback for connecting, since `0.0.0.0` is
 not a valid destination on Windows.
+
+## Multi-model consensus
+
+Review with several models and see which findings they independently agree on:
+
+```bash
+python $S/cli.py review --consensus                            # models from config
+python $S/cli.py review --models qwen3-coder:30b,gpt-oss:20b   # named explicitly
+```
+
+Findings are reconciled across models and tagged `agreed by ...` or `only ...`,
+with corroborated ones sorted first. Where models disagree on how bad something
+is, the report says so.
+
+**Nothing is discarded.** Filtering to agreements only would buy precision with
+recall, and recall is this reviewer's weak side — on a four-defect fixture a
+single model caught three, and the defect that mattered most in dogfooding was
+one no model raised. A lone finding is not thereby wrong; corroboration is a
+prioritisation signal, not a verdict.
+
+Pick models from *different families*. Their mistakes are then less correlated,
+which is the entire point. Two runs cost roughly double the time of one.
+
+Choose the second model deliberately: measured on the planted-defect fixture,
+`qwen3-coder:30b` found 3, `gpt-oss:20b` 5, `qwen3.8:27b` 4 — and `gemma4:26b`
+found **0**, returning valid, empty, useless JSON. A model that finds nothing
+contributes nothing but latency.
 
 ## Exit codes
 

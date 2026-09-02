@@ -21,6 +21,7 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import collect  # noqa: E402
+import consensus  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
@@ -43,6 +44,7 @@ DEFAULTS = {
     "base_url": "http://127.0.0.1:11434",
     "model": "qwen3-coder:30b",
     "fallback_models": [],
+    "consensus_models": [],
     "temperature": 0.1,
     "timeout_s": 180,
     "connect_timeout_s": 5,
@@ -256,70 +258,131 @@ def cmd_review(args):
     except collect.InputError as e:
         return fail(e.to_dict(), args.json, notes)
 
-    # ---- resolve model -------------------------------------------------
+    # ---- resolve model(s) ----------------------------------------------
+    requested = []
+    if args.models:
+        requested = [m.strip() for m in args.models.split(",") if m.strip()]
+    elif args.consensus:
+        requested = list(cfg.get("consensus_models") or [])
+        if not requested:
+            return fail(
+                {
+                    "kind": "input",
+                    "detail": "--consensus was given but consensus_models is empty.",
+                    "remedy": 'Set "consensus_models" in config.json, or use '
+                    "--models a,b to name them directly.",
+                },
+                args.json,
+                notes,
+            )
+    elif args.model:
+        requested = [args.model]
+
     try:
-        models = oc.list_models(cfg)
-        names = {m.get("name") for m in models if m.get("name")}
-        model, rnotes = oc.resolve_model(cfg, args.model, names)
-        notes += rnotes
+        installed = oc.list_models(cfg)
+        names = {m.get("name") for m in installed if m.get("name")}
+        if requested:
+            models = []
+            for want in requested:
+                resolved, rnotes = oc.resolve_model(cfg, want, names)
+                notes += rnotes
+                if resolved not in models:
+                    models.append(resolved)
+        else:
+            resolved, rnotes = oc.resolve_model(cfg, None, names)
+            notes += rnotes
+            models = [resolved]
     except oc.OllamaError as e:
         return fail(e.to_dict(), args.json, notes)
+
+    if len(models) == 1 and len(requested) > 1:
+        notes.append(
+            "All requested models resolved to %s; consensus needs at least two "
+            "distinct models." % models[0]
+        )
 
     # ---- review each chunk under a shared deadline ---------------------
     started = time.time()
     deadline = started + cfg["timeout_s"]
-    findings = []
+    per_model = [(m, []) for m in models]
+    by_model = dict((m, fs) for m, fs in per_model)
+    active = list(models)
     chunk_errors = []
     degraded = []
 
     for chunk in inp.chunks:
-        remaining = deadline - time.time()
-        if remaining <= 5:
-            chunk_errors.append(
-                {
-                    "label": chunk.label,
-                    "error": {
-                        "kind": "timeout",
-                        "detail": "Overall time budget exhausted before this chunk.",
-                        "remedy": "Raise --timeout or review fewer files at once.",
-                    },
-                }
-            )
-            continue
-        try:
-            got, mode, meta = review_chunk(
-                cfg, model, chunk, inp.kind, focus, args, remaining
-            )
-            for f in got:
-                if f["location"] in ("unspecified", "") or "/" not in f["location"]:
-                    f["location"] = "%s: %s" % (chunk.label, f["location"])
-            findings += got
-            if meta.get("degraded"):
-                degraded.append("%s: %s" % (chunk.label, meta["degraded"]))
-            if meta.get("output_truncated"):
-                degraded.append("%s: model output hit the length limit" % chunk.label)
-            if meta.get("input_possibly_truncated"):
-                degraded.append(
-                    "%s: %s" % (chunk.label, meta["input_possibly_truncated"])
+        for model in list(active):
+            remaining = deadline - time.time()
+            if remaining <= 5:
+                chunk_errors.append(
+                    {
+                        "label": chunk.label,
+                        "model": model,
+                        "error": {
+                            "kind": "timeout",
+                            "detail": "Overall time budget exhausted before this chunk.",
+                            "remedy": "Raise --timeout or review fewer files at once."
+                            + (
+                                " Reviewing with %d models multiplies the work."
+                                % len(models)
+                                if len(models) > 1
+                                else ""
+                            ),
+                        },
+                    }
                 )
-        except oc.OllamaError as e:
-            chunk_errors.append({"label": chunk.label, "error": e.to_dict()})
-            if e.kind in ("unreachable", "model_missing", "cloud_blocked"):
-                break
+                continue
+            try:
+                got, mode, meta = review_chunk(
+                    cfg, model, chunk, inp.kind, focus, args, remaining
+                )
+                for f in got:
+                    if f["location"] in ("unspecified", "") or "/" not in f["location"]:
+                        f["location"] = "%s: %s" % (chunk.label, f["location"])
+                by_model[model] += got
+                for key, msg in (
+                    ("degraded", None),
+                    ("output_truncated", "model output hit the length limit"),
+                    ("input_possibly_truncated", None),
+                ):
+                    if meta.get(key):
+                        text = msg or meta[key]
+                        degraded.append("%s (%s): %s" % (chunk.label, model, text))
+            except oc.OllamaError as e:
+                chunk_errors.append(
+                    {"label": chunk.label, "model": model, "error": e.to_dict()}
+                )
+                # A dead model drops out of the rest of the run; the others carry on.
+                if e.kind in ("unreachable", "model_missing", "cloud_blocked"):
+                    active.remove(model)
+                    notes.append(
+                        "Dropped %s after a fatal error: %s" % (model, e.detail)
+                    )
+        if not active:
+            break
 
-    if not findings and chunk_errors and len(chunk_errors) == len(inp.chunks):
-        worst = chunk_errors[0]["error"]
-        return fail(worst, args.json, notes)
+    total = sum(len(fs) for fs in by_model.values())
+    if not total and chunk_errors and not active:
+        return fail(chunk_errors[0]["error"], args.json, notes)
+
+    if len(models) > 1:
+        merged = consensus.sort_merged(consensus.reconcile(per_model))
+        agreement = consensus.summarize(per_model, merged)
+    else:
+        merged = by_model[models[0]]
+        agreement = None
 
     status = "partial" if (chunk_errors or degraded) else "ok"
     result = {
         "status": status,
-        "model": model,
+        "model": models[0] if len(models) == 1 else None,
+        "models": models,
+        "agreement": agreement,
         "adversarial": bool(args.adversarial),
         "focus": focus,
         "elapsed_s": round(time.time() - started, 2),
         "input": inp.summary(),
-        "findings": findings,
+        "findings": merged,
         "chunk_errors": chunk_errors,
         "notes": notes + degraded,
         "error": None,
@@ -337,11 +400,27 @@ def build_parser():
     p.add_argument("--debug", action="store_true", help="include tracebacks and traces")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    st = sub.add_parser("status", help="check Ollama health and list models")
+    # --json and --debug are also accepted after the subcommand. argparse would
+    # otherwise reject `review --json`, which is the ordering everyone reaches for.
+    # default=SUPPRESS matters: without it the subparser writes its own False over
+    # a --json given before the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    common.add_argument(
+        "--debug", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+
+    st = sub.add_parser(
+        "status", parents=[common], help="check Ollama health and list models"
+    )
     st.add_argument("--model", help="model to test resolution for")
     st.set_defaults(func=cmd_status)
 
-    rv = sub.add_parser("review", help="review a diff, files, or stdin")
+    rv = sub.add_parser(
+        "review", parents=[common], help="review a diff, files, or stdin"
+    )
     src = rv.add_argument_group("input source")
     src.add_argument("--file", nargs="+", help="explicit file paths")
     src.add_argument("--ref", help="review the diff against this ref (REF...HEAD)")
@@ -352,6 +431,16 @@ def build_parser():
     rv.add_argument("--adversarial", action="store_true", help="adversarial design critique")
     rv.add_argument("--instructions", help="extra steering, e.g. 'focus on the retry loop'")
     rv.add_argument("--model", help="override the review model")
+    rv.add_argument(
+        "--models",
+        help="comma-separated models to review with; findings are reconciled "
+        "across them and tagged with which models raised each one",
+    )
+    rv.add_argument(
+        "--consensus",
+        action="store_true",
+        help="review with the models in config.json's consensus_models",
+    )
     rv.add_argument("--temperature", type=float, help="override temperature")
     rv.add_argument("--timeout", type=int, help="overall time budget in seconds")
     rv.set_defaults(func=cmd_review)

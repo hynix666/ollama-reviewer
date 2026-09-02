@@ -1,7 +1,7 @@
 # Local Ollama Reviewer — Design
 
 **Date:** 2026-09-02
-**Status:** Implemented and verified (20/20 self-checks passing)
+**Status:** Implemented and verified (26/26 self-checks passing)
 **Location:** `~/.claude/skills/ollama-reviewer/`
 
 ---
@@ -187,6 +187,37 @@ the directory as `~/.claude/commands/ollama` yields `/ollama:review`,
 original flat `/ollama-review` form. This happens to match the naming in the
 original protocol that motivated the project.
 
+### D11 — Consensus annotates; it does not filter
+
+The original sketch in this document proposed reporting only findings that two
+models both raise. Implementation reversed that.
+
+Filtering to agreements buys precision by spending recall, and recall is this
+reviewer's weak side: against the four-defect fixture a single model caught
+three, and the defect that mattered most during dogfooding — the silent context
+truncation in D9 — was raised by no model at all. Discarding lone findings would
+remove exactly the class of result that is scarce.
+
+So `--models a,b` and `--consensus` run every model over every chunk and
+reconcile the results, tagging each finding with which models produced it and
+sorting corroborated ones first. Nothing is dropped. Where models disagree on
+severity, the spread is reported rather than silently resolved.
+
+Matching is structural and deterministic — same category, same file, then line
+proximity, symbol overlap, or `difflib` similarity on the issue text. A third
+model adjudicating was rejected: it would add latency, a new failure mode, and
+another unverifiable judgment to the pipeline.
+
+A dead model drops out mid-run rather than aborting the review; the survivors
+finish and the report names what was lost.
+
+**Model choice matters more than the mechanism.** Measured on the fixture:
+`gpt-oss:20b` 5 findings, `qwen3.8:27b` 4, `qwen3-coder:30b` 3, and
+`gemma4:26b` **0** — valid, empty, useless JSON. The first configured default
+paired qwen3-coder with gemma4 and produced zero corroboration by construction;
+it was replaced with gpt-oss after measurement. Prefer models from different
+families, so their errors are less correlated.
+
 ## 5. Architecture
 
 ```
@@ -202,7 +233,8 @@ original protocol that motivated the project.
      +-- prompts.py        system + user prompts, response schema
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
      +-- render.py         tolerant parsing + Markdown rendering
-     +-- selftest.py       20 checks, all error paths
+     +-- selftest.py       26 checks, all error paths
+     +-- consensus.py      cross-model reconciliation of findings
 ```
 
 Six modules, ~1,700 lines, Python standard library only. Each module has one
@@ -277,7 +309,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 20 checks with no inference required: configuration loading,
+`selftest.py` runs 26 checks, 23 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `--live` additionally reviews a fixture containing planted defects.
@@ -320,8 +352,9 @@ labels carry no authority.** This is why §3's reporting requirement exists.
   preferable to Bash invocation.
 - **Background mode.** Cut in D8. The seams (chunk labels, shared deadline) would
   accommodate it without rework should long reviews become common.
-- **Multi-model consensus.** Running two differently-biased models and reporting only
-  findings both raise would likely improve precision, at roughly double the latency.
+- **Multi-model consensus.** Implemented — see D11, which reverses this section's
+  original "report only findings both raise" proposal in favour of annotating
+  corroboration without discarding anything.
 
 ## 12. Known risks
 

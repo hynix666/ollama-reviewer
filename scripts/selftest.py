@@ -15,6 +15,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cli  # noqa: E402
+import consensus  # noqa: E402
 import collect  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
@@ -241,6 +242,83 @@ def t_parse_garbage():
     return "returns None so the caller can degrade"
 
 
+def _finding(
+    sev="high",
+    cat="security",
+    loc="a.py:10",
+    issue="SQL injection via string concatenation",
+    fix="use parameters",
+):
+    return {
+        "severity": sev,
+        "category": cat,
+        "location": loc,
+        "issue": issue,
+        "why": "attacker controls the name argument",
+        "suggested_fix": fix,
+    }
+
+
+def t_consensus_merges_agreement():
+    a = _finding()
+    b = _finding(loc="a.py:11", issue="SQL injection through string concatenation")
+    merged = consensus.reconcile([("m1", [a]), ("m2", [b])])
+    assert len(merged) == 1, "the same defect should merge, got %d" % len(merged)
+    assert merged[0]["agreement"] == "corroborated"
+    assert merged[0]["raised_by"] == ["m1", "m2"]
+    return "2 models -> 1 corroborated finding"
+
+
+def t_consensus_keeps_singles():
+    a = _finding()
+    b = _finding(cat="performance", loc="z.py:99", issue="unbounded cache growth")
+    merged = consensus.reconcile([("m1", [a]), ("m2", [b])])
+    assert len(merged) == 2, "unrelated findings must not merge"
+    assert all(f["agreement"] == "single" for f in merged)
+    return "nothing discarded"
+
+
+def t_consensus_respects_file_and_category():
+    a = _finding()
+    same_text_other_file = _finding(loc="b.py:10")
+    assert not consensus.same_defect(a, same_text_other_file), "different files merged"
+    same_text_other_cat = _finding(cat="logic")
+    assert not consensus.same_defect(a, same_text_other_cat), "different categories merged"
+    return "file and category are hard boundaries"
+
+
+def t_consensus_sorts_corroborated_first():
+    a = _finding(sev="low")
+    b = _finding(sev="low", loc="a.py:10")
+    lone = _finding(sev="critical", cat="logic", loc="q.py:1", issue="off by one")
+    merged = consensus.sort_merged(
+        consensus.reconcile([("m1", [a, lone]), ("m2", [b])])
+    )
+    assert merged[0]["model_count"] == 2, "corroborated finding should sort first"
+    return "corroborated outranks a lone critical"
+
+
+def t_consensus_severity_spread():
+    a = _finding(sev="critical")
+    b = _finding(sev="low", loc="a.py:10")
+    merged = consensus.reconcile([("m1", [a]), ("m2", [b])])
+    assert merged[0]["severity_spread"] == ["critical", "low"]
+    assert merged[0]["severity"] == "critical", "representative takes the worst severity"
+    return "disagreement recorded"
+
+
+def t_consensus_parses_messy_locations():
+    for loc, want_file, want_line in [
+        ("C:/Users/x/planted.py: find_user", "planted.py", None),
+        ("collect.py:104", "collect.py", 104),
+        ("in the retry loop", None, None),
+    ]:
+        f, ln, _ = consensus.parse_location(loc)
+        assert f == want_file, "%r -> file %r, wanted %r" % (loc, f, want_file)
+        assert ln == want_line, "%r -> line %r, wanted %r" % (loc, ln, want_line)
+    return "handles paths, line numbers and prose"
+
+
 def t_render_never_crashes():
     md = render.to_markdown({"status": "error", "error": {"detail": "d", "remedy": "r"}})
     assert "unavailable" in md.lower()
@@ -331,6 +409,12 @@ def main():
         ("parse: garbage returns None", t_parse_garbage),
         ("context covers max input", t_context_covers_max_input),
         ("context scales down", t_context_scales_down),
+        ("consensus: merges agreement", t_consensus_merges_agreement),
+        ("consensus: keeps singles", t_consensus_keeps_singles),
+        ("consensus: file/category bounds", t_consensus_respects_file_and_category),
+        ("consensus: corroborated first", t_consensus_sorts_corroborated_first),
+        ("consensus: severity spread", t_consensus_severity_spread),
+        ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("render never crashes", t_render_never_crashes),
         ("prompts well-formed", t_prompt_shape),
     ]

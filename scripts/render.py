@@ -131,8 +131,11 @@ def to_markdown(result):
         return "\n".join(lines)
 
     inp = result.get("input", {})
+    agreement = result.get("agreement")
+    models = result.get("models") or [result.get("model") or "?"]
+    title = models[0] if len(models) == 1 else "%d models" % len(models)
     lines += [
-        "# Local review - %s" % result.get("model", "?"),
+        "# Local review - %s" % title,
         "",
         "%s | %s chunk(s), %s chars | %.1fs"
         % (
@@ -143,6 +146,19 @@ def to_markdown(result):
         ),
         "",
     ]
+    if agreement:
+        raw = agreement.get("raw_counts", {})
+        lines += [
+            "Reviewed by: %s"
+            % ", ".join("`%s` (%d raw)" % (m, raw.get(m, 0)) for m in agreement["models"]),
+            "",
+            "After reconciling: **%d corroborated**, %d raised by a single model."
+            % (agreement["corroborated"], agreement["single"]),
+            "",
+            "> Corroboration raises confidence; it does not confer correctness, and a "
+            "single-model finding is not thereby wrong. Verify either way.",
+            "",
+        ]
 
     for note in result.get("notes", []):
         lines.append("- Note: %s" % note)
@@ -178,9 +194,21 @@ def to_markdown(result):
     lines += ["**%d finding(s):** %s" % (len(findings), summary), ""]
 
     for i, f in enumerate(findings, 1):
+        header = "### %d. %s %s - %s" % (
+            i,
+            SEVERITY_ICON.get(f["severity"], ""),
+            f["category"],
+            f["location"],
+        )
+        if f.get("raised_by"):
+            # ASCII only: Windows consoles default to cp1252 and mangle anything else.
+            header += "  --  %s" % (
+                "agreed by %s" % ", ".join(f["raised_by"])
+                if f.get("model_count", 1) > 1
+                else "only %s" % f["raised_by"][0]
+            )
         lines += [
-            "### %d. %s %s - %s"
-            % (i, SEVERITY_ICON.get(f["severity"], ""), f["category"], f["location"]),
+            header,
             "",
             "**Issue:** %s" % (f["issue"] or "(none stated)"),
             "",
@@ -189,6 +217,15 @@ def to_markdown(result):
             "**Suggested fix:** %s" % (f["suggested_fix"] or "(none stated)"),
             "",
         ]
+        if f.get("severity_spread"):
+            lines += [
+                "**Severity disputed:** %s rated it %s."
+                % (
+                    "models" if f.get("model_count", 1) > 1 else "runs",
+                    " / ".join(f["severity_spread"]),
+                ),
+                "",
+            ]
 
     if result.get("status") == "partial":
         lines += [

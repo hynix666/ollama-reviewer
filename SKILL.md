@@ -37,6 +37,7 @@ python $SCRIPTS/cli.py review --file a.py b.py         # explicit files
 git diff | python $SCRIPTS/cli.py review --stdin       # piped
 python $SCRIPTS/cli.py review --adversarial --file x.py
 python $SCRIPTS/cli.py review --focus security,tests --file x.py
+python $SCRIPTS/cli.py review --consensus --file x.py   # cross-check two models
 python $SCRIPTS/cli.py review --instructions "focus on the retry loop" --file x.py
 python $SCRIPTS/cli.py review --json                   # machine-readable
 python $SCRIPTS/selftest.py                            # verify setup
