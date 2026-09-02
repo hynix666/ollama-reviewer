@@ -217,6 +217,11 @@ injection, the unhandled `None`, and the off-by-one — and missed a
 callers, tests, or invariants. A clean review is weak evidence, not proof, and never
 a substitute for tests.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: standard library only,
+Python 3.8 is the floor, and nothing may give the model authority to decide or edit.
+
 ## License
 
 [MIT](LICENSE) © 2026 hynix666
