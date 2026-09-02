@@ -1,12 +1,12 @@
 # ollama-reviewer
 
+[![CI](https://github.com/hynix666/ollama-reviewer/actions/workflows/ci.yml/badge.svg)](https://github.com/hynix666/ollama-reviewer/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/hynix666/ollama-reviewer?color=blue)](LICENSE)
+![Last commit](https://img.shields.io/github/last-commit/hynix666/ollama-reviewer)
 ![Python](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-2ea44f)
-![Self-tests](https://img.shields.io/badge/self--tests-20%20passing-2ea44f)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-777)
 ![Inference](https://img.shields.io/badge/inference-100%25%20local-ff6d00)
 ![Role](https://img.shields.io/badge/model%20role-advisory%20only-6f42c1)
-![License](https://img.shields.io/badge/license-MIT-blue)
 
 A local Ollama model as a **code reviewer assistant** for Claude Code. It advises;
 Claude decides. The model never edits files and never has final say.
@@ -38,7 +38,9 @@ python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
 20 checks should pass. Add `--live` to also run real inference against a file with
-deliberately planted defects.
+deliberately planted defects, or `--offline` to skip the three checks that need a
+running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
+Windows and macOS.
 
 ## Commands
 

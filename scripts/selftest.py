@@ -38,15 +38,28 @@ def greet(user):
 
 RESULTS = []
 
+# Checks that need a live Ollama server. Everything else is pure logic or local
+# filesystem work, so CI can run the bulk of the suite without an inference server.
+NEEDS_SERVER = {
+    "server reachable",
+    "default model resolves",
+    "bare family name resolves",
+    "live review of planted defects",
+}
+
 
 def check(name, fn):
     try:
         detail = fn()
-        RESULTS.append((True, name, detail or "ok"))
+        RESULTS.append(("PASS", name, detail or "ok"))
     except AssertionError as e:
-        RESULTS.append((False, name, "assertion failed: %s" % e))
+        RESULTS.append(("FAIL", name, "assertion failed: %s" % e))
     except Exception as e:
-        RESULTS.append((False, name, "unexpected %s: %s" % (type(e).__name__, e)))
+        RESULTS.append(("FAIL", name, "unexpected %s: %s" % (type(e).__name__, e)))
+
+
+def skip(name, reason):
+    RESULTS.append(("SKIP", name, reason))
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +305,11 @@ def t_live_review():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="also run real inference")
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip checks needing a live Ollama server (for CI)",
+    )
     args = ap.parse_args()
 
     checks = [
@@ -316,21 +334,31 @@ def main():
         ("render never crashes", t_render_never_crashes),
         ("prompts well-formed", t_prompt_shape),
     ]
-    for name, fn in checks:
-        check(name, fn)
-
     if args.live:
-        check("live review of planted defects", t_live_review)
+        checks.append(("live review of planted defects", t_live_review))
+
+    for name, fn in checks:
+        if args.offline and name in NEEDS_SERVER:
+            skip(name, "offline mode: needs a live Ollama server")
+        else:
+            check(name, fn)
 
     print("\n%-34s %s" % ("CHECK", "RESULT"))
     print("-" * 78)
-    failed = 0
-    for ok, name, detail in RESULTS:
-        if not ok:
+    failed = passed = skipped = 0
+    for status, name, detail in RESULTS:
+        if status == "FAIL":
             failed += 1
-        print("%-34s %-4s %s" % (name, "PASS" if ok else "FAIL", detail))
+        elif status == "SKIP":
+            skipped += 1
+        else:
+            passed += 1
+        print("%-34s %-4s %s" % (name, status, detail))
     print("-" * 78)
-    print("%d passed, %d failed" % (len(RESULTS) - failed, failed))
+    summary = "%d passed, %d failed" % (passed, failed)
+    if skipped:
+        summary += ", %d skipped" % skipped
+    print(summary)
     return 1 if failed else 0
 
 

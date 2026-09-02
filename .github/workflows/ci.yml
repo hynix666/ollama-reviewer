@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the workflow only ever reads the repository.
+permissions:
+  contents: read
+
+# A newer push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 pinned to ubuntu-22.04: actions/python-versions does not ship a
+        # 3.8 build for ubuntu-24.04. The oldest entry exists to prove the
+        # "python 3.8+" badge rather than assert it.
+        include:
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.11" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Catches syntax unsupported on older interpreters before any test runs.
+      - name: Byte-compile all modules
+        run: python -m compileall -q scripts
+
+      # --offline skips the three checks needing a live Ollama server; the
+      # remaining 17 cover error taxonomy, parsing, input validation and
+      # context sizing, none of which need inference.
+      - name: Self-test
+        run: python scripts/selftest.py --offline
+
+  installers:
+    name: installer syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash syntax check
+        run: bash -n install.sh
+
+      - name: executable bit preserved
+        run: test -x install.sh || (echo "install.sh is not executable" && exit 1)
+
+      - name: PowerShell parse check
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly"
+
+      - name: LF line endings on shell script
+        run: |
+          if grep -qU $'\r' install.sh; then
+            echo "install.sh contains CRLF, which breaks the POSIX shebang"
+            exit 1
+          fi
+          echo "install.sh is LF-clean"
