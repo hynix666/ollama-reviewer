@@ -8,9 +8,20 @@ your own Ollama server.
 
 ## Install
 
-Already installed if you are reading this from `~/.claude/skills/ollama-reviewer/`.
-Otherwise copy the tree to `~/.claude/skills/ollama-reviewer/` and the four command
-files to `~/.claude/commands/`. Then verify:
+Clone into your skills directory, then link the commands:
+
+```bash
+git clone git@github.com:hynix666/ollama-reviewer.git ~/.claude/skills/ollama-reviewer
+powershell -File ~/.claude/skills/ollama-reviewer/install.ps1     # Windows
+bash ~/.claude/skills/ollama-reviewer/install.sh                  # macOS / Linux
+```
+
+The installer links `commands/` in this repo to `~/.claude/commands/ollama`, so the
+repo stays the single source of truth — edit a command here and the slash command
+changes with it. On Windows it uses a **directory junction**, which needs no
+administrator rights; on macOS and Linux, a symlink.
+
+Then verify:
 
 ```bash
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
@@ -23,10 +34,13 @@ deliberately planted defects.
 
 | Slash command | What it does |
 |---|---|
-| `/ollama-review` | Review the uncommitted diff, a ref, or named files |
-| `/ollama-review-file` | Review specific paths |
-| `/ollama-adversarial` | Assume the design is wrong; attack the assumptions |
-| `/ollama-status` | Ollama health plus installed models |
+| `/ollama:review` | Review the uncommitted diff, a ref, or named files |
+| `/ollama:review-file` | Review specific paths |
+| `/ollama:adversarial` | Assume the design is wrong; attack the assumptions |
+| `/ollama:status` | Ollama health plus installed models |
+
+The `ollama:` prefix comes from the directory name the installer links to
+(`~/.claude/commands/ollama/`); Claude Code namespaces commands by folder.
 
 ## CLI
 

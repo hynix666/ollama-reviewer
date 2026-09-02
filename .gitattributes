@@ -4,3 +4,10 @@
 *.py   text eol=lf
 *.md   text eol=lf
 *.json text eol=lf
+
+# Shell scripts MUST be LF: a CRLF shebang fails on POSIX with
+# "bad interpreter: /usr/bin/env bash^M".
+*.sh   text eol=lf
+
+# PowerShell is Windows-native; CRLF is the least surprising there.
+*.ps1  text eol=crlf

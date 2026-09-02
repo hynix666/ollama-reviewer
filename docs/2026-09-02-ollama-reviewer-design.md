@@ -163,11 +163,35 @@ defect available here: silent, and it manufactures false confidence.
 server reports `prompt_eval_count` close to the limit, the review is marked
 `partial` with an explicit warning. Two regression tests guard the invariant.
 
+### D10 — Commands live in the repo, linked out by directory junction
+
+The four slash commands must sit under `~/.claude/commands/` to be discovered, but
+belong in the repository so a clone is self-contained. Linking rather than copying
+keeps one source of truth.
+
+*Rejected — file symlinks.* Windows requires Developer Mode or an elevated shell to
+create them, and requesting administrator rights to install a code-review helper is
+disproportionate.
+
+*Rejected — hardlinks.* They work unprivileged, but git replaces files rather than
+editing them in place, so a `checkout` or `pull` silently severs the link. Silent
+breakage is worse than no link.
+
+Chosen: a **directory junction** (`mklink /J`) on Windows, a symlink on POSIX. Both
+resolve a path rather than an inode, so they survive git operations. Junctions need
+no elevation.
+
+The consequence is a rename: Claude Code namespaces commands by folder, so linking
+the directory as `~/.claude/commands/ollama` yields `/ollama:review`,
+`/ollama:review-file`, `/ollama:adversarial`, and `/ollama:status` rather than the
+original flat `/ollama-review` form. This happens to match the naming in the
+original protocol that motivated the project.
+
 ## 5. Architecture
 
 ```
-  slash commands (~/.claude/commands/*.md)   prompt files -> tell Claude what to run
-            |
+  ~/.claude/commands/ollama  --junction-->  <repo>/commands/*.md
+            |                                prompt files -> tell Claude what to run
             v
   SKILL.md  protocol: roles, triage duty, honest limits
             |
