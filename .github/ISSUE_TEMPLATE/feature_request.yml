@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest a capability or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One constraint governs what can be accepted: **the model advises, it never
+        decides.** Anything giving it a filesystem write path, letting findings
+        gate a command's exit code, or otherwise moving authority from the agent
+        to the model is out of scope, however convenient. See
+        [CONTRIBUTING.md](https://github.com/hynix666/ollama-reviewer/blob/main/CONTRIBUTING.md).
+
+        Also: standard library only. A proposal requiring a PyPI package needs to
+        justify breaking clone-and-run installation.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you hitting?
+      description: Describe the situation, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?
+      description: >-
+        Existing flags worth checking first: `--focus`, `--instructions`,
+        `--adversarial`, `--model`, `--timeout`.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints
+      options:
+        - label: This does not let the model edit files or make decisions
+          required: true
+        - label: This does not require a third-party dependency
+          required: false

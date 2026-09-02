@@ -1,0 +1,93 @@
+name: Review quality
+description: The reviewer hallucinated a finding, missed a real defect, or graded severity badly
+labels: ["review-quality", "prompt"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Wrong findings are expected, not surprising.** When this tool reviewed
+        its own source, 2 of 9 findings survived verification, and the
+        highest-severity finding that run was a hallucination. The design assumes
+        this: the agent filters, and findings never gate anything.
+
+        So the useful reports are the *patterns* — a category of mistake that
+        recurs, or a defect class the reviewer reliably walks past. One bad
+        finding on one file is usually just the model being a quantised model.
+
+        These reports feed prompt changes. Note that prompt edits are the
+        riskiest change in this repository, so concrete reproductions matter more
+        here than anywhere else.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What went wrong?
+      options:
+        - False positive — reported a defect that is not real
+        - False negative — missed a defect that is present
+        - Severity was badly wrong
+        - Location was vague or incorrect
+        - Output could not be parsed into findings
+        - Findings contradicted each other
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantisation
+      description: From `python scripts/cli.py status`
+      placeholder: "qwen3-coder:30b (Q4_K_M)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: code
+    attributes:
+      label: The code that was reviewed
+      description: >-
+        The smallest snippet that reproduces it. Please make sure you are allowed
+        to share it — do not paste proprietary source.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: said
+    attributes:
+      label: What the reviewer said
+      description: Paste the relevant finding, including its stated trigger.
+    validations:
+      required: true
+
+  - type: textarea
+    id: wrong
+    attributes:
+      label: Why that is wrong, or what it should have caught
+      description: >-
+        For a false positive, name the reason the stated trigger cannot occur.
+        For a false negative, name the defect and the input that triggers it.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: repro
+    attributes:
+      label: Does it reproduce?
+      options:
+        - Every time
+        - Most runs
+        - Saw it once
+        - Have not retried
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I verified the claim against the actual code rather than trusting the finding
+          required: true
+        - label: I tried a second model (`--model`) to see whether it is model-specific
+          required: false

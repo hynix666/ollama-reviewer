@@ -1,0 +1,92 @@
+name: Bug report
+description: The tool crashed, mishandled an error, or behaved incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is for defects in the **tool**: a crash, a misclassified error, a
+        broken install, a wrong exit code.
+
+        If the tool worked correctly but the *model's review* was wrong — a
+        hallucinated finding, a missed bug — please use the
+        **Review quality** template instead. Wrong findings are an expected
+        property of local quantised models, not a bug in this code.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: What broke?
+      options:
+        - Install / linking the slash commands
+        - CLI crashed or hung
+        - Error was misclassified or the remedy was wrong
+        - Exit code was wrong
+        - Output could not be parsed or rendered
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      render: shell
+      placeholder: python scripts/cli.py review --file foo.py
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of the status command
+      description: "`python scripts/cli.py status`"
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: debug
+    attributes:
+      label: Debug output
+      description: >-
+        Re-run with `--debug` for tracebacks and the retry trace. Check it before
+        pasting: it includes file paths and your model list, though never
+        credentials.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11 / macOS 15 / Ubuntu 24.04
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: "`python --version`"
+      placeholder: "3.11.9"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I ran `python scripts/selftest.py` and included any failures above
+          required: true
+        - label: I confirmed Ollama is running (`ollama serve`)
+          required: false

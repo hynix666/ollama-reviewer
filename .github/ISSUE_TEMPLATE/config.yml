@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ollama is not running, or a model is missing
+    url: https://github.com/hynix666/ollama-reviewer#error-playbook
+    about: The README error playbook covers connectivity, missing models, OOM and timeouts, each with its remedy.
+  - name: Why the tool is built this way
+    url: https://github.com/hynix666/ollama-reviewer/blob/main/docs/2026-09-02-ollama-reviewer-design.md
+    about: The design document records the decisions and the alternatives that were rejected, including measured signal quality.
+  - name: Contributing guide
+    url: https://github.com/hynix666/ollama-reviewer/blob/main/CONTRIBUTING.md
+    about: Setup, the Python 3.8 floor, how to add a typed error, and how to evaluate prompt changes.
