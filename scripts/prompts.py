@@ -20,6 +20,27 @@ FOCUS_AREAS = {
 
 DEFAULT_FOCUS = ["logic", "security", "performance", "edge-cases", "tests"]
 
+
+def resolve_focus(requested, adversarial=False):
+    """Validate a focus request against FOCUS_AREAS; inject 'design' for
+    adversarial runs. Shared by every front end so the wording of the
+    rejection and the adversarial rule exist in exactly one place.
+
+    Returns (focus_list, None) on success or (None, message) when the request
+    names unknown areas. `requested` may be None/empty for the default set,
+    a comma-separated string (CLI style), or a list (MCP style).
+    """
+    if isinstance(requested, str):
+        requested = [f.strip().lower() for f in requested.split(",") if f.strip()]
+    focus = list(requested) if requested else list(DEFAULT_FOCUS)
+    bad = [f for f in focus if f not in FOCUS_AREAS]
+    if bad:
+        return None, "Unknown focus area(s): %s. Valid: %s" % (
+            ", ".join(bad), ", ".join(sorted(FOCUS_AREAS)))
+    if adversarial and "design" not in focus:
+        focus.append("design")
+    return focus, None
+
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
 
 RESPONSE_SCHEMA = {

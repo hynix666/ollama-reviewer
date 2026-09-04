@@ -134,16 +134,22 @@ def reconcile(per_model):
     return [_merge(c) for c in clusters]
 
 
-def sort_merged(findings):
-    """Corroborated first, then by severity, then by category."""
-    return sorted(
-        findings,
-        key=lambda f: (
-            -f.get("model_count", 1),
-            SEVERITY_RANK.get(f.get("severity"), 99),
-            f.get("category") or "",
-        ),
+def sort_key(finding):
+    """Corroborated first, then by severity, then by category.
+
+    Findings without model_count default to 1, so for single-model runs the
+    corroboration term is a constant and plain severity order falls out.
+    """
+    return (
+        -finding.get("model_count", 1),
+        SEVERITY_RANK.get(finding.get("severity"), 99),
+        finding.get("category") or "",
     )
+
+
+def sort_merged(findings):
+    """Findings sorted by sort_key: the one report order."""
+    return sorted(findings, key=sort_key)
 
 
 def summarize(per_model, merged):

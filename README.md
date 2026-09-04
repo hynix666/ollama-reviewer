@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-39 checks should pass (36 without a running Ollama server). Add `--live` to also run real inference against a file with
+51 checks should pass (48 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.
@@ -85,8 +85,31 @@ deadline, costs a real file its turn. Skips are listed by name in the output.
 `--all-files` includes them; a diff containing nothing but prose reviews the
 prose rather than failing.
 
+**Untracked files are reviewed too.** `git diff` never shows a brand-new,
+never-added file, so the default uncommitted-diff review folds in non-ignored
+untracked ones. They ride the same pipeline as tracked files - binary probe,
+prose filter, caps - so untracked prose cannot starve code, and a repo with no
+commits yet still reviews the untracked files that are all it has. Every
+inclusion is reported; files skipped at read time (binary, unreadable, empty)
+are named with their reasons, and a diff that ends up empty says what was
+skipped and why in the error body itself. Scope is deliberate: `--staged`
+cannot include them (they are unstaged by definition) and `--ref` excludes
+them, because a ref diff compares two commits that an untracked file belongs
+to neither of.
+
+**Input sources are exclusive.** `--file`, `--stdin`, `--ref` and `--staged`
+cannot be combined: asking for two is an input error that names the conflicting
+flags, never a silent priority order — and a stated `--ref` conflicts even when
+its value is empty, so `--ref "" --staged` fails loudly instead of quietly
+reviewing the staged diff. Everything else composes: `--all-files` is a modifier
+(not a source) and works with every source, including piped stdin; `--focus`,
+`--adversarial` and `--instructions` apply to whatever source won. The same
+exclusivity rule backs the MCP tools, where `ref` and `staged` are arguments on
+one tool and `{"ref": ""}` counts as stated.
+
 **The timeout scales with the model count.** Two models get twice the budget,
 since each re-reviews every chunk. An explicit `--timeout` is never overridden.
+The same rule applies through the MCP server, which shares the one helper.
 Bare model families work — `--model qwen3-coder` resolves to an installed tag.
 
 ## Configuration
@@ -151,8 +174,8 @@ python $S/cli.py review --models qwen3-coder:30b,gpt-oss:20b   # named explicitl
 ```
 
 Findings are reconciled across models and tagged `agreed by ...` or `only ...`,
-with corroborated ones sorted first. Where models disagree on how bad something
-is, the report says so.
+with corroborated ones sorted first — in both the Markdown report and the JSON.
+Where models disagree on how bad something is, the report says so.
 
 **Nothing is discarded.** Filtering to agreements only would buy precision with
 recall, and recall is this reviewer's weak side — on a four-defect fixture a
@@ -192,8 +215,9 @@ contributes nothing but latency.
 | `Request exceeded the configured timeout` | Big input or slow model | Raise `--timeout`, fewer files, smaller model |
 | `Ollama returned HTTP 4xx/5xx` | Bad request or server fault | 404 usually means a wrong model name |
 | `returned non-JSON output` | Model emitted prose | Handled automatically by the parser tiers |
-| `The diff is empty` | Nothing changed | Use `--file` or `--ref` |
+| `The diff is empty` | Nothing reviewable, even after untracked pickup | Use `--file` or `--ref`; the error lists what was skipped and why |
 | `Not a git repository` | Wrong directory | Use `--cwd` or `--file` |
+| `Conflicting input sources` | Two of `--file/--stdin/--ref/--staged` given | Pick one source |
 | `Skipped <path> (binary...)` | Non-text input | Expected; binaries are never sent |
 | `TRUNCATED` in output | File over `max_file_chars` | Raise the cap or review fewer files |
 | `some input may have been dropped` | Prompt filled the context window | Review fewer files at once; the finding set may be incomplete |

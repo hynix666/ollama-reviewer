@@ -23,11 +23,8 @@ import collect  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
+import config
 import review  # noqa: E402
-
-CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json"
-)
 
 EXIT_OK, EXIT_INPUT, EXIT_UNAVAILABLE, EXIT_TIMEOUT, EXIT_INTERNAL = 0, 2, 3, 4, 5
 
@@ -38,58 +35,6 @@ ERROR_EXIT = {
     "timeout": EXIT_TIMEOUT,
     "internal": EXIT_INTERNAL,
 }
-
-DEFAULTS = {
-    "base_url": "http://127.0.0.1:11434",
-    "model": "qwen3-coder:30b",
-    "fallback_models": [],
-    "consensus_models": [],
-    "temperature": 0.1,
-    "timeout_s": 180,
-    "connect_timeout_s": 5,
-    "max_retries": 3,
-    "backoff_base_s": 1.5,
-    "max_file_chars": 60000,
-    "max_total_chars": 180000,
-    "max_files": 25,
-    "allow_cloud_models": False,
-}
-
-
-def load_config():
-    """Config file over defaults, environment over both. Never fails hard."""
-    cfg = dict(DEFAULTS)
-    notes = []
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-            cfg.update(json.load(fh))
-    except FileNotFoundError:
-        notes.append("No config.json found; using built-in defaults.")
-    except json.JSONDecodeError as e:
-        notes.append("config.json is malformed (%s); using built-in defaults." % e)
-
-    env_url = os.environ.get("OLLAMA_HOST")
-    if env_url:
-        cfg["base_url"] = env_url
-        notes.append("Endpoint overridden by OLLAMA_HOST (%s)." % env_url)
-
-    normalized = oc.normalize_base_url(cfg["base_url"])
-    if normalized != cfg["base_url"].rstrip("/"):
-        notes.append(
-            "Rewrote bind address %s to %s for connecting." % (cfg["base_url"], normalized)
-        )
-    cfg["base_url"] = normalized
-
-    if os.environ.get("OLLAMA_REVIEW_MODEL"):
-        cfg["model"] = os.environ["OLLAMA_REVIEW_MODEL"]
-        notes.append("Model overridden by OLLAMA_REVIEW_MODEL.")
-    if os.environ.get("OLLAMA_REVIEW_TIMEOUT"):
-        try:
-            cfg["timeout_s"] = int(os.environ["OLLAMA_REVIEW_TIMEOUT"])
-        except ValueError:
-            notes.append("OLLAMA_REVIEW_TIMEOUT is not an integer; ignored.")
-    return cfg, notes
-
 
 def emit(result, as_json, markdown_fn=render.to_markdown):
     if as_json:
@@ -110,20 +55,8 @@ def fail(error_dict, as_json, notes=None, markdown_fn=render.to_markdown):
     return ERROR_EXIT.get(error_dict.get("kind"), EXIT_INPUT)
 
 
-def human_size(n):
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return "%.0f%s" % (n, unit)
-        n /= 1024
-    return "%.1fTB" % n
-
-
 def cmd_status(args):
-    cfg, notes = load_config()
+    cfg, notes = config.load_config()
     try:
         models = oc.list_models(cfg)
     except oc.OllamaError as e:
@@ -146,7 +79,7 @@ def cmd_status(args):
         "models": [
             {
                 "name": m.get("name"),
-                "size_h": human_size(m.get("size")),
+                "size_h": render.human_size(m.get("size")),
                 "context": (m.get("details") or {}).get("context_length", "?"),
             }
             for m in sorted(models, key=lambda x: x.get("name") or "")
@@ -157,29 +90,33 @@ def cmd_status(args):
 
 
 def cmd_review(args):
-    cfg, notes = load_config()
+    cfg, notes = config.load_config()
     explicit_timeout = bool(args.timeout)
     if explicit_timeout:
         cfg["timeout_s"] = args.timeout
 
-    # ---- validate focus ------------------------------------------------
-    focus = prompts.DEFAULT_FOCUS
-    if args.focus:
-        wanted = [f.strip().lower() for f in args.focus.split(",") if f.strip()]
-        bad = [f for f in wanted if f not in prompts.FOCUS_AREAS]
-        if bad:
-            return fail(
-                {
-                    "kind": "input",
-                    "detail": "Unknown focus area(s): %s" % ", ".join(bad),
-                    "remedy": "Valid areas: %s" % ", ".join(prompts.FOCUS_AREAS),
-                },
-                args.json,
-                notes,
-            )
-        focus = wanted
-    if args.adversarial and "design" not in focus:
-        focus = focus + ["design"]
+    # ---- validate focus (policy lives in prompts.resolve_focus) ---------
+    focus, ferr = prompts.resolve_focus(args.focus, adversarial=args.adversarial)
+    if ferr:
+        return fail({"kind": "input", "detail": ferr}, args.json, notes)
+
+    # ---- one input source, loudly ---------------------------------------
+    # Two source flags used to fall through to from_git, where ref outranked
+    # staged silently: exit 0 while reviewing a different diff than asked.
+    sources = [name for name, on in
+               (("file", args.file), ("stdin", args.stdin),
+                ("ref", args.ref is not None), ("staged", args.staged)) if on]
+    if len(sources) > 1:
+        return fail(
+            {
+                "kind": "input",
+                "detail": "Conflicting input sources: %s." % " ".join(
+                    "--" + s for s in sources),
+                "remedy": "Pick one: --file PATHS, --stdin, --ref REF, or --staged.",
+            },
+            args.json,
+            notes,
+        )
 
     # ---- which models were asked for -----------------------------------
     if args.models:
@@ -222,14 +159,14 @@ def cmd_review(args):
     except oc.OllamaError as e:
         return fail(e.to_dict(), args.json, notes)
 
-    # Each extra model re-reviews every chunk, so a budget sized for one model
-    # silently starves the later files. Scale it unless the user set one.
-    if not explicit_timeout and len(models) > 1:
-        cfg["timeout_s"] *= len(models)
-        notes.append(
-            "Timeout scaled to %ds for %d models; pass --timeout to override."
-            % (cfg["timeout_s"], len(models))
+    # Engine policy lives in review.scale_timeout_for_models; the front end
+    # only decides whether the user set an explicit timeout.
+    if not explicit_timeout:
+        cfg["timeout_s"], note = review.scale_timeout_for_models(
+            cfg["timeout_s"], len(models)
         )
+        if note:
+            notes.append(note + " Pass --timeout to override.")
 
     opts = review.ReviewOptions(
         adversarial=args.adversarial,
