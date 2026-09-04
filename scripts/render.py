@@ -1,15 +1,12 @@
-"""The output contract: tolerant parsing of model output, and Markdown rendering.
+"""Markdown rendering of review results: the presentation half of the output.
 
-Parsing and rendering live together because they are two halves of one contract -
-if you change the finding shape, you must change both.
+Model-output parsing lives in review.py next to its engine consumer; this
+module turns finished results and errors into what the user sees.
 """
 
-import json
-import re
+import consensus
+from prompts import SEVERITIES
 
-from prompts import FOCUS_AREAS, SEVERITIES
-
-SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITIES)}
 SEVERITY_ICON = {
     "critical": "[CRITICAL]",
     "high": "[HIGH]",
@@ -18,97 +15,28 @@ SEVERITY_ICON = {
     "info": "[INFO]",
 }
 
-
-def _balanced_object(text):
-    """Extract the first balanced {...} region, ignoring braces inside strings."""
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    escape = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
-
-def parse_findings(text):
-    """Tolerantly extract findings from model output.
-
-    Returns (findings, parse_mode) where parse_mode is "strict", "fenced",
-    "salvaged", or None when nothing parseable was found.
-    """
-    if not text:
-        return None, None
-
-    for candidate, mode in _candidates(text):
-        try:
-            data = json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if isinstance(data, list):
-            data = {"findings": data}
-        if not isinstance(data, dict):
-            continue
-        raw = data.get("findings")
-        if raw is None and "severity" in data:
-            raw = [data]
-        if not isinstance(raw, list):
-            continue
-        return [_normalize(f) for f in raw if isinstance(f, dict)], mode
-
-    return None, None
-
-
-def _candidates(text):
-    stripped = text.strip()
-    yield stripped, "strict"
-    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
-    if fence:
-        yield fence.group(1).strip(), "fenced"
-    salvaged = _balanced_object(text)
-    if salvaged:
-        yield salvaged, "salvaged"
-
-
-def _normalize(f):
-    """Coerce a finding into the contract, tolerating model sloppiness."""
-    sev = str(f.get("severity", "info")).strip().lower()
-    if sev not in SEVERITY_RANK:
-        sev = "info"
-    cat = str(f.get("category", "logic")).strip().lower()
-    if cat not in FOCUS_AREAS:
-        cat = "logic"
-    return {
-        "severity": sev,
-        "category": cat,
-        "location": str(f.get("location") or "unspecified").strip(),
-        "issue": str(f.get("issue") or "").strip(),
-        "why": str(f.get("why") or "").strip(),
-        "suggested_fix": str(f.get("suggested_fix") or "").strip(),
-    }
+def human_size(n):
+    """Presentation helper: bytes to a short human string for status output."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return "%.0f%s" % (n, unit)
+        n /= 1024
+    return "%.1fTB" % n
 
 
 def sort_findings(findings):
-    return sorted(
-        findings, key=lambda f: (SEVERITY_RANK.get(f["severity"], 99), f["category"])
-    )
+    """Report order: the consensus key, shared with consensus.sort_merged.
+
+    One implementation of "corroborated first, then severity, then category",
+    so the rule cannot drift between formats: a two-model-agreed high
+    outranks a lone critical, and single-model runs (no model_count) keep
+    plain severity order because the corroboration term defaults to 1.
+    """
+    return sorted(findings, key=consensus.sort_key)
 
 
 def to_markdown(result):
@@ -264,7 +192,7 @@ def status_markdown(payload):
         "",
         "Endpoint: `%s`" % payload.get("base_url"),
         "Configured model: `%s`" % payload.get("configured_model"),
-        "Resolved model: `%s`" % payload.get("resolved_model", "(unresolved)"),
+        "Resolved model: `%s`" % (payload.get("resolved_model") or "(unresolved)"),
         "Fallback chain: %s" % (", ".join(payload.get("fallback_models") or []) or "(none)"),
         "",
         "## Installed models",

@@ -26,8 +26,8 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cli  # noqa: E402
 import collect  # noqa: E402
+import config  # noqa: E402
 import ollama_client as oc  # noqa: E402
 import prompts  # noqa: E402
 import render  # noqa: E402
@@ -153,14 +153,10 @@ def _error_text(err):
 
 
 def _validated_focus(args):
-    focus = args.get("focus") or prompts.DEFAULT_FOCUS
-    bad = [f for f in focus if f not in prompts.FOCUS_AREAS]
-    if bad:
-        raise ValueError(
-            "Unknown focus area(s): %s. Valid: %s" % (", ".join(bad), ", ".join(_FOCUS))
-        )
-    if args.get("adversarial") and "design" not in focus:
-        focus = list(focus) + ["design"]
+    focus, err = prompts.resolve_focus(
+        args.get("focus"), adversarial=bool(args.get("adversarial")))
+    if err:
+        raise ValueError(err)
     return focus
 
 
@@ -172,6 +168,11 @@ def _run(cfg, notes, inp, args):
         adversarial=bool(args.get("adversarial")),
         instructions=args.get("instructions"),
     )
+    cfg["timeout_s"], note = review.scale_timeout_for_models(
+        cfg["timeout_s"], len(models)
+    )
+    if note:
+        notes.append(note)
     result = review.run_review(cfg, models, inp, focus, opts, notes)
     if args.get("format") == "json":
         return _ok(json.dumps(result, indent=2))
@@ -181,7 +182,7 @@ def _run(cfg, notes, inp, args):
 def call_tool(name, args):
     """Dispatch one tool call. Never raises; failures come back as isError."""
     args = args or {}
-    cfg, notes = cli.load_config()
+    cfg, notes = config.load_config()
     try:
         if name == "ollama_list_models":
             installed = oc.list_models(cfg)
@@ -203,7 +204,7 @@ def call_tool(name, args):
                 "models": [
                     {
                         "name": m.get("name"),
-                        "size_h": cli.human_size(m.get("size")),
+                        "size_h": render.human_size(m.get("size")),
                         "context": (m.get("details") or {}).get("context_length", "?"),
                     }
                     for m in sorted(installed, key=lambda x: x.get("name") or "")

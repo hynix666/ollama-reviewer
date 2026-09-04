@@ -281,19 +281,21 @@ respected exactly.
   SKILL.md  protocol: roles, triage duty, honest limits
             |
             v
-  cli.py    orchestration, exit codes, top-level exception barrier
+  cli.py    argument parsing, exit codes, top-level exception barrier
      |
+     +-- config.py         config loading: defaults, file, environment
      +-- collect.py        git diff / files / stdin -> validated chunks
-     +-- prompts.py        system + user prompts, response schema
+     +-- prompts.py        system + user prompts, schema, focus policy
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
-     +-- render.py         tolerant parsing + Markdown rendering
-     +-- review.py         orchestration: models over chunks, result assembly
+     +-- review.py         tolerant parsing + models over chunks + assembly
+     +-- render.py         Markdown rendering of results (presentation only)
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       39 checks, all error paths
+     +-- selftest.py       51 checks, all error paths
+     +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
 
-Six modules, ~1,700 lines, Python standard library only. Each module has one
+Ten modules, ~2,400 lines, Python standard library only. Each module has one
 responsibility and can be read whole.
 
 **Data flow:** source selection → validation and capping → per-chunk prompt
@@ -332,10 +334,38 @@ nothing was verified, so a failed review can never be mistaken for a clean one.
 
 **Sources:** uncommitted diff (default), `--staged`, `--ref REF` (`REF...HEAD`),
 `--file PATH...`, `--stdin` (auto-detects whether piped input is a diff).
+Sources are exclusive: asking for two is an input error naming the conflicting
+flags, at the CLI parser and again in `from_git` (which the MCP front end also
+routes through) - the old silent precedence, where `--ref` outranked
+`--staged`, reviewed a diff the user did not ask for while exiting 0. A
+*stated* `--ref` counts even when its value is empty (`--ref ""` or MCP
+`{"ref": ""}`), which truthiness testing let slip past the guard. Every other
+flag composes: `--all-files` is a modifier, not a source, and applies to all
+five collection paths including piped stdin; focus, adversarial mode and
+instructions are orthogonal modifiers over whichever source won.
 
 **Rejections, each with its own message:** missing paths, directories, binaries (by
 extension *and* null-byte probe), empty files, empty diffs, non-repositories,
-permission errors, unknown revisions.
+permission errors, unknown revisions. Nothing-to-review errors name what was
+skipped and why in the error body itself, not only in the remedy clause.
+
+**Untracked files:** `git diff` never shows a brand-new, never-added file, so the
+default uncommitted-diff review folds in non-ignored untracked ones. Scope is
+deliberate, not accidental. Default: include, because a never-added file is the
+most common kind of uncommitted work and the alternative failed with "the diff
+is empty" while the user was looking at real changes. `--staged`: exclude,
+necessarily - an untracked file is unstaged by definition. `--ref`: exclude,
+because a ref diff answers "what changed between two commits", and an untracked
+file belongs to neither of them; including it would silently change the
+question asked.
+
+Untracked sections are synthesized as whole-file diffs and pass through exactly
+the same pipeline as tracked ones - binary probe, prose filter, per-file and
+total caps - so untracked prose cannot starve code and untracked files cannot
+exceed the caps. A repository with no commits yet has no `HEAD` to diff
+against; it is probed rather than failed, and the untracked files that are all
+the repo has still get reviewed. Every inclusion is warned about, and files
+skipped at read time (binary, unreadable, empty) are named with reasons.
 
 **Caps:** 60,000 chars per file, 180,000 total, 25 files. Exceeding a cap produces an
 explicit warning naming what was dropped — never a silent omission.
@@ -365,10 +395,14 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 39 checks, 36 of them with no inference required: configuration loading,
+`selftest.py` runs 51 checks, 48 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
-safety. `--live` additionally reviews a fixture containing planted defects.
+safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the
+tier-2 budget/rescue ladder is proven over a real socket with controlled latency,
+and all three MCP review tools - including `ollama_review_file` - get real
+dispatch-level coverage offline. `--live` additionally reviews a fixture containing
+planted defects.
 
 The suite proved its worth immediately by catching two real bugs in the
 implementation on its first run: the `0.0.0.0` connect failure (D6) and the health
