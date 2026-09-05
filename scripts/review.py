@@ -306,9 +306,13 @@ def _budget_exhausted_error(model_count):
 def run_review(cfg, models, inp, focus, opts, notes):
     """Run every model over every chunk under one shared deadline.
 
-    `notes` is appended to in place. Raises ReviewFailure when nothing usable
-    came back at all; a partial result is returned rather than raised, so a
-    single dead model never discards the others' work.
+    `notes` is appended to in place. Raises ReviewFailure when every model
+    failed on every chunk - nothing usable came back at all, whatever the
+    error kind. Total loss is not "the review ran"; a partial result (at
+    least one finding anywhere) is returned rather than raised, so a single
+    dead model never discards the others' work. Fatal kinds (unreachable,
+    model_missing, cloud_blocked) drop a model from the rest of the run;
+    transient kinds stay active so later chunks can retry.
     """
     started = time.time()
     deadline = started + cfg["timeout_s"]
@@ -358,7 +362,7 @@ def run_review(cfg, models, inp, focus, opts, notes):
             break
 
     total = sum(len(fs) for fs in by_model.values())
-    if not total and chunk_errors and not active:
+    if not total and chunk_errors:
         raise ReviewFailure(chunk_errors[0]["error"])
 
     if len(models) > 1:

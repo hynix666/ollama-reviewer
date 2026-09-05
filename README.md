@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-54 checks should pass (51 without a running Ollama server). Add `--live` to also run real inference against a file with
+57 checks should pass (54 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.
@@ -195,13 +195,15 @@ contributes nothing but latency.
 
 | Code | Meaning |
 |---|---|
-| 0 | The review ran. Findings, or none, are both success. |
+| 0 | The review ran. Findings, or none, are both success; a partially degraded run (some chunks failed, others survived) also exits 0 with `status: partial` |
 | 2 | Input error — bad paths, empty diff, not a repository |
-| 3 | Ollama unavailable — server down, model missing, cloud blocked |
+| 3 | Ollama unavailable — server down, model missing, cloud blocked, or server-side HTTP/OOM/loading/malformed errors |
 | 4 | Timeout |
 | 5 | Internal error |
 
 **Findings never produce a non-zero exit.** The script reports; you judge.
+
+**Total loss is not "the review ran".** If every model fails on every chunk — server errors, timeouts, a dead model — nothing came back at all, and the run exits `3` (or `4` for a timeout) with a structured `error` instead of a success. Partial loss (some findings survived) stays a `0` with `status: partial` and a `chunk_errors` list naming what failed.
 
 ## Error playbook
 

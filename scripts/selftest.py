@@ -857,6 +857,170 @@ def t_pinned_timeout_is_not_scaled():
     return "explicit --timeout honoured; unpinned run scales"
 
 
+def t_all_chunks_failed_is_an_error():
+    """Every model failing on every chunk must fail loudly, not exit 0.
+
+    Regression guard: the ReviewFailure raise was gated on a model dropping
+    fatally, so non-fatal kinds (5xx, budget exhaustion) returned success
+    with status "partial" - scripts checking exit codes saw a clean 0 for
+    a review where nothing came back at all.
+    """
+    import fake_ollama
+
+    srv = fake_ollama.start({"fake:1b": [{"status": 500}] * 4})
+    try:
+        with _fake_host(srv.base_url), _tmpdir() as tmp:
+            target = os.path.join(tmp, "vuln.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("x = 1 + 2")
+            code, out = _capture_cli(
+                ["review", "--file", target, "--json", "--models", "fake:1b"])
+            rep = json.loads(out)
+            assert code == 3, "total loss must exit 3, got %s" % code
+            assert rep["status"] == "error", rep["status"]
+            assert rep["error"]["kind"] == "http_5xx", rep["error"]
+            assert not rep["findings"], rep["findings"]
+            assert rep["error"]["detail"] and rep["error"]["remedy"], rep["error"]
+    finally:
+        srv.close()
+    return "total loss exits 3 with a typed error, not success"
+
+
+def t_partial_run_keeps_surviving_findings():
+    """A failing chunk degrades the run but preserves everything else.
+
+    Wire proof of the partial contract: status "partial", the surviving
+    model's findings from both chunks, chunk_errors naming each failing
+    chunk x model combo, and the degradation visible in markdown.
+    """
+    import fake_ollama
+
+    good = json.dumps(
+        {"findings": [{"line": 1, "severity": "high", "category": "correctness",
+                       "location": "1", "title": "t", "detail": "d",
+                       "suggestion": "s", "confidence": "high"}]})
+    diff = """diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-x
++y
+diff --git a/b.py b/b.py
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-x
++y
+"""
+    srv = fake_ollama.start({
+        "fake:1b": [{"body": good}] * 3,
+        "fake:2b": [{"status": 500}] * 5,
+    })
+    try:
+        cfg, _ = config.load_config()
+        cfg = dict(cfg, base_url=srv.base_url)
+        inp = collect.from_text(cfg, diff, "ignored", "stdin")
+        labels = [c.label for c in inp.chunks]
+        assert labels == ["a.py", "b.py"], labels
+        notes = []
+        result = review.run_pipeline(
+            cfg, ["fake:1b", "fake:2b"], inp, prompts.DEFAULT_FOCUS,
+            review.ReviewOptions(), notes)
+        assert result["status"] == "partial", result["status"]
+        assert result["error"] is None, result["error"]
+        findings = result["findings"]
+        assert len(findings) >= 2, findings
+        covered = set()
+        for f in findings:
+            for label in labels:
+                if (f.get("location") or "").startswith(label):
+                    covered.add(label)
+        assert covered == set(labels), [f.get("location") for f in findings]
+        failing = [(ce["label"], ce["model"]) for ce in result["chunk_errors"]]
+        assert sorted(set(l for l, _ in failing)) == labels, failing
+        assert all(m == "fake:2b" for _, m in failing), failing
+        assert not any("Dropped" in n for n in result["notes"]), result["notes"]
+        md = render.to_markdown(result)
+        assert "Chunk `a.py` failed" in md, md[:600]
+        assert "Chunk `b.py` failed" in md, md[:600]
+        assert all(r["model"] in ("fake:1b", "fake:2b") for r in srv.log)
+    finally:
+        srv.close()
+    return "partial: surviving findings kept, failures named and rendered"
+
+
+def t_fatal_drop_does_not_kill_the_run():
+    """A model dying fatally drops out; the others carry on every chunk.
+
+    The stub cannot script a fatal kind by construction - the client maps
+    connect failures to unreachable and scripted HTTP to 4xx/5xx - so the
+    fatal error is injected at oc.generate, keeping the rest of the run on
+    the real wire. Proves the FATAL_KINDS contract: the dead model is
+    dropped after its first chunk, the drop is reported, and the survivor
+    still reviews every remaining chunk.
+    """
+    import fake_ollama
+
+    good = json.dumps(
+        {"findings": [{"line": 1, "severity": "high", "category": "correctness",
+                       "location": "1", "title": "t", "detail": "d",
+                       "suggestion": "s", "confidence": "high"}]})
+    diff = """diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-x
++y
+diff --git a/b.py b/b.py
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-x
++y
+"""
+    srv = fake_ollama.start({
+        "fake:1b": [{"body": good}] * 3,
+        "fake:2b": [{"body": good}] * 3,
+    })
+    orig = oc.generate
+    try:
+        def poisoned(cfg, model, *a, **k):
+            if model == "fake:2b":
+                raise oc.OllamaError(
+                    "unreachable", "simulated server death mid-run",
+                    "start the server and retry")
+            return orig(cfg, model, *a, **k)
+        oc.generate = poisoned
+        cfg, _ = config.load_config()
+        cfg = dict(cfg, base_url=srv.base_url)
+        inp = collect.from_text(cfg, diff, "ignored", "stdin")
+        labels = [c.label for c in inp.chunks]
+        notes = []
+        result = review.run_pipeline(
+            cfg, ["fake:1b", "fake:2b"], inp, prompts.DEFAULT_FOCUS,
+            review.ReviewOptions(), notes)
+        assert result["status"] == "partial", result["status"]
+        covered = set()
+        for f in result["findings"]:
+            for label in labels:
+                if (f.get("location") or "").startswith(label):
+                    covered.add(label)
+        assert covered == set(labels), covered
+        assert [n for n in result["notes"] if "Dropped fake:2b" in n], (
+            result["notes"])
+        assert [ce["model"] for ce in result["chunk_errors"]] == ["fake:2b"], (
+            result["chunk_errors"])
+        assert [ce["error"]["kind"] for ce in result["chunk_errors"]] == [
+            "unreachable"], result["chunk_errors"]
+        assert len(srv.log) == 2 and all(
+            r["model"] == "fake:1b" for r in srv.log), srv.log
+    finally:
+        oc.generate = orig
+        srv.close()
+    return "fatal drop: dead model gone, survivor finished every chunk"
+
+
+
 def t_status_snapshot_is_shared():
     """Both front ends must build status through one engine snapshot.
 
@@ -1227,6 +1391,9 @@ def main():
         ("collect: untracked pipeline honest", t_untracked_honest_pipeline),
         ("collect: empty-diff bodies name skips", t_empty_diff_names_skips),
         ("review: tier 2 budget + tier 1 rescue", t_tier2_budget_and_tier1_rescue),
+        ("review: all chunks failed is an error", t_all_chunks_failed_is_an_error),
+        ("review: partial run keeps surviving findings", t_partial_run_keeps_surviving_findings),
+        ("review: fatal drop leaves others running", t_fatal_drop_does_not_kill_the_run),
         ("explicit --timeout is honoured", t_pinned_timeout_is_not_scaled),
         ("status snapshot shared by cli and mcp", t_status_snapshot_is_shared),
         ("timeout scaling shared by cli and mcp", t_timeout_scaling_is_shared),

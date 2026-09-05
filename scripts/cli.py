@@ -6,7 +6,8 @@ valid Markdown (or JSON with --json) and exits with a meaningful code.
 Exit codes
   0  the review ran (findings, or none, are both success)
   2  input error - bad paths, empty diff, not a repo
-  3  Ollama unavailable - server down, model missing, cloud blocked
+  3  Ollama unavailable - server down, model missing, cloud blocked,
+     or server-side HTTP/OOM/loading/malformed errors
   4  timeout
   5  internal error
 """
@@ -32,6 +33,11 @@ ERROR_EXIT = {
     "unreachable": EXIT_UNAVAILABLE,
     "model_missing": EXIT_UNAVAILABLE,
     "cloud_blocked": EXIT_UNAVAILABLE,
+    "http_5xx": EXIT_UNAVAILABLE,
+    "http_4xx": EXIT_UNAVAILABLE,
+    "oom": EXIT_UNAVAILABLE,
+    "loading": EXIT_UNAVAILABLE,
+    "malformed": EXIT_UNAVAILABLE,
     "timeout": EXIT_TIMEOUT,
     "internal": EXIT_INTERNAL,
 }
