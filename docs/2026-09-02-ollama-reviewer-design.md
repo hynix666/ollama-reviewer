@@ -59,7 +59,11 @@ This is enforced by four mechanisms, not by good intentions:
 1. **The tool only reads.** It has no write path to the filesystem. There is no
    configuration in which the model can modify code.
 2. **Findings never produce a failing exit code.** Exit codes describe tool health
-   (`0` ran, `2` bad input, `3` unavailable, `4` timeout, `5` internal). If findings
+   (`0` ran, including a run degraded by failing chunks, `2` bad input, `3`
+   unavailable, `4` timeout, `5` internal). Every model failing on every chunk
+   raises instead of exiting 0 - total loss is not "the review ran" - while a
+   partial result (some findings survived) still exits 0 with `status:
+   "partial"` and `chunk_errors` naming what failed. If findings
    could fail the command, the model's opinion would become a gate — inverting the
    authority the design exists to protect.
 3. **The prompt demands falsifiable claims.** Every finding must name the concrete
@@ -293,7 +297,7 @@ respected exactly.
      +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       54 checks, all error paths
+     +-- selftest.py       57 checks, all error paths
      +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
@@ -398,7 +402,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 54 checks, 51 of them with no inference required: configuration loading,
+`selftest.py` runs 57 checks, 54 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the
