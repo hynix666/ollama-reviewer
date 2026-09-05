@@ -179,9 +179,10 @@ def run_pipeline(cfg, models, inp, focus, opts, notes,
     budget for N models, and run.
 
     Both front ends call this so resolve/scale/run has exactly one
-    landing place. Raises the engine's typed errors only:
-    InputError, OllamaError, ReviewFailure -- each front end
-    translates them for its transport.
+    landing place. Raises the engine's typed errors -- OllamaError and
+    ReviewFailure -- for each front end to translate for its transport.
+    InputError is not raised here: collect raises it upstream, already
+    typed, and it propagates through untouched.
     """
     models = resolve_models(cfg, list(models), notes)
     if timeout_pinned:

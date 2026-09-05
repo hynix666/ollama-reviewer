@@ -816,6 +816,47 @@ def t_no_double_prefixed_locations():
     assert sep_named["location"] == "collect.py:7", sep_named["location"]
     return "prefixed once, named locations untouched"
 
+def t_pinned_timeout_is_not_scaled():
+    """An explicit --timeout must be honoured, not silently rescaled.
+
+    Regression guard: when timeout scaling moved behind the shared engine
+    entry point, the pin gate existed in the signature but not the body, so
+    a pinned --timeout was silently scaled anyway. The suite had never
+    driven this path; this check makes it permanent.
+    """
+    import fake_ollama
+
+    good = json.dumps(
+        {"findings": [{"line": 1, "severity": "high", "category": "correctness",
+                       "title": "t", "detail": "d", "suggestion": "s",
+                       "confidence": "high"}]})
+    scripts = {"fake:1b": [{"body": good}] * 3,
+               "fake:2b": [{"body": good}] * 3}
+    srv = fake_ollama.start(scripts)
+    try:
+        with _fake_host(srv.base_url), _tmpdir() as tmp:
+            target = os.path.join(tmp, "vuln.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("x = 1 + 2")
+            pinned = _capture_cli([
+                "review", "--file", target, "--json",
+                "--models", "fake:1b,fake:2b", "--timeout", "123"])
+            result = json.loads(pinned[1])
+            assert pinned[0] == 0 and result["status"] == "ok", pinned
+            assert not any(
+                "scaled" in n.lower() for n in result.get("notes", [])), result["notes"]
+            loose = _capture_cli([
+                "review", "--file", target, "--json",
+                "--models", "fake:1b,fake:2b"])
+            result2 = json.loads(loose[1])
+            assert loose[0] == 0 and result2["status"] == "ok", loose
+            assert any(
+                "scaled" in n.lower() for n in result2.get("notes", [])), result2["notes"]
+    finally:
+        srv.close()
+    return "explicit --timeout honoured; unpinned run scales"
+
+
 def t_timeout_scaling_is_shared():
     """CLI and MCP must apply the same timeout-scaling rule.
 
@@ -1137,6 +1178,7 @@ def main():
         ("collect: untracked pipeline honest", t_untracked_honest_pipeline),
         ("collect: empty-diff bodies name skips", t_empty_diff_names_skips),
         ("review: tier 2 budget + tier 1 rescue", t_tier2_budget_and_tier1_rescue),
+        ("explicit --timeout is honoured", t_pinned_timeout_is_not_scaled),
         ("timeout scaling shared by cli and mcp", t_timeout_scaling_is_shared),
         ("collect+cli: conflicting sources fail loudly", t_conflicting_source_flags_fail),
         ("review: no double-prefixed locations", t_no_double_prefixed_locations),
