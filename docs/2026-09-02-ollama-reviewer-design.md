@@ -246,7 +246,9 @@ and formats the return value. Had the orchestration still lived inside
 output. Today both front ends go one step further and call the single
 engine entry point, `review.run_pipeline`, which owns resolve -> scale ->
 run; each adapter only translates the engine's typed errors for its own
-transport.
+transport. The engine treats both its arguments as read-only - the scaled
+budget is applied to an engine-owned copy - and returns the budget
+decision and the full notes in the result dict.
 
 **The stdout discipline is the sharp edge.** A stdio MCP server may emit nothing
 but JSON-RPC frames; one stray `print` corrupts the stream and the client
@@ -297,7 +299,7 @@ respected exactly.
      +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       57 checks, all error paths
+     +-- selftest.py       58 checks, all error paths
      +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
@@ -402,7 +404,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 57 checks, 54 of them with no inference required: configuration loading,
+`selftest.py` runs 58 checks, 55 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the

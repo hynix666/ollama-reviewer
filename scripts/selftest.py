@@ -838,6 +838,7 @@ def t_pinned_timeout_is_not_scaled():
             target = os.path.join(tmp, "vuln.py")
             with open(target, "w", encoding="utf-8") as fh:
                 fh.write("x = 1 + 2")
+            base_timeout = int(config.load_config()[0]["timeout_s"])
             pinned = _capture_cli([
                 "review", "--file", target, "--json",
                 "--models", "fake:1b,fake:2b", "--timeout", "123"])
@@ -845,6 +846,9 @@ def t_pinned_timeout_is_not_scaled():
             assert pinned[0] == 0 and result["status"] == "ok", pinned
             assert not any(
                 "scaled" in n.lower() for n in result.get("notes", [])), result["notes"]
+            assert result["timeout_s"] == 123, (
+                "pinned budget must be returned in the result, got %s"
+                % result["timeout_s"])
             loose = _capture_cli([
                 "review", "--file", target, "--json",
                 "--models", "fake:1b,fake:2b"])
@@ -852,6 +856,9 @@ def t_pinned_timeout_is_not_scaled():
             assert loose[0] == 0 and result2["status"] == "ok", loose
             assert any(
                 "scaled" in n.lower() for n in result2.get("notes", [])), result2["notes"]
+            assert result2["timeout_s"] == base_timeout * 2, (
+                "scaled budget must travel in the result, got %s"
+                % result2["timeout_s"])
     finally:
         srv.close()
     return "explicit --timeout honoured; unpinned run scales"
@@ -1018,6 +1025,53 @@ diff --git a/b.py b/b.py
         oc.generate = orig
         srv.close()
     return "fatal drop: dead model gone, survivor finished every chunk"
+
+
+
+def t_engine_leaves_caller_state_untouched():
+    """run_pipeline must not mutate the caller's cfg or notes list.
+
+    Ownership pass: the budget decision used to be written into the
+    caller's cfg dict (180 -> 360 on the caller's object) and notes were
+    appended into the caller's list by reference, so the engine's state
+    leaked into its caller. Both now live only in the returned dict --
+    result["timeout_s"] and result["notes"] -- and the caller's objects
+    are provably unchanged.
+    """
+    import fake_ollama
+
+    good = json.dumps(
+        {"findings": [{"line": 1, "severity": "high", "category": "correctness",
+                       "location": "1", "title": "t", "detail": "d",
+                       "suggestion": "s", "confidence": "high"}]})
+    srv = fake_ollama.start({
+        "fake:1b": [{"body": good}] * 2,
+        "fake:2b": [{"body": good}] * 2,
+    })
+    try:
+        cfg, _ = config.load_config()
+        cfg = dict(cfg, base_url=srv.base_url)
+        seed = ["a seed note from the caller"]
+        base = cfg["timeout_s"]
+        inp = collect.from_text(cfg, "x = 1" + chr(10), "t.py")
+        result = review.run_pipeline(
+            cfg, ["fake:1b", "fake:2b"], inp, prompts.DEFAULT_FOCUS,
+            review.ReviewOptions(), seed)
+        assert cfg["timeout_s"] == base, (
+            "run_pipeline rewrote the caller's cfg: %s -> %s"
+            % (base, cfg["timeout_s"]))
+        assert seed == ["a seed note from the caller"], (
+            "caller's notes list was mutated: %r" % seed)
+        assert result["timeout_s"] == base * 2, (
+            "scaled budget must be returned in the result, got %s"
+            % result["timeout_s"])
+        assert result["notes"][0] == "a seed note from the caller", (
+            result["notes"])
+        assert any("Timeout scaled" in n for n in result["notes"]), (
+            result["notes"])
+    finally:
+        srv.close()
+    return "engine returns its budget and notes; caller state untouched"
 
 
 
@@ -1395,6 +1449,7 @@ def main():
         ("review: partial run keeps surviving findings", t_partial_run_keeps_surviving_findings),
         ("review: fatal drop leaves others running", t_fatal_drop_does_not_kill_the_run),
         ("explicit --timeout is honoured", t_pinned_timeout_is_not_scaled),
+        ("engine: caller state untouched by run_pipeline", t_engine_leaves_caller_state_untouched),
         ("status snapshot shared by cli and mcp", t_status_snapshot_is_shared),
         ("timeout scaling shared by cli and mcp", t_timeout_scaling_is_shared),
         ("collect+cli: conflicting sources fail loudly", t_conflicting_source_flags_fail),

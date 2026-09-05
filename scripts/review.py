@@ -183,16 +183,24 @@ def run_pipeline(cfg, models, inp, focus, opts, notes,
     ReviewFailure -- for each front end to translate for its transport.
     InputError is not raised here: collect raises it upstream, already
     typed, and it propagates through untouched.
+
+    Caller state is read-only: cfg is never rewritten (the scaled budget
+    goes to an engine-owned copy) and notes is a seed, never appended to.
+    The returned dict carries the full notes and the budget decision
+    (result["timeout_s"]).
     """
+    notes = list(notes)
     models = resolve_models(cfg, list(models), notes)
-    if timeout_pinned:
-        note = None
-    else:
-        cfg["timeout_s"], note = scale_timeout_for_models(
-            cfg["timeout_s"], len(models))
-    if note:
-        notes.append(note + timeout_note_suffix)
-    return run_review(cfg, models, inp, focus, opts, notes)
+    budget_s = cfg["timeout_s"]
+    if not timeout_pinned:
+        budget_s, note = scale_timeout_for_models(budget_s, len(models))
+        if note:
+            notes.append(note + timeout_note_suffix)
+    run_cfg = dict(cfg)
+    run_cfg["timeout_s"] = budget_s
+    result = run_review(run_cfg, models, inp, focus, opts, notes)
+    result["timeout_s"] = budget_s
+    return result
 
 def _raw_finding(chunk, raw):
     """Tier 3: the model's unparseable output, preserved as an info finding."""
