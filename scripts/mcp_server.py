@@ -163,17 +163,12 @@ def _validated_focus(args):
 def _run(cfg, notes, inp, args):
     """Shared tail of every review tool."""
     focus = _validated_focus(args)
-    models = review.resolve_models(cfg, list(args.get("models") or []), notes)
     opts = review.ReviewOptions(
         adversarial=bool(args.get("adversarial")),
         instructions=args.get("instructions"),
     )
-    cfg["timeout_s"], note = review.scale_timeout_for_models(
-        cfg["timeout_s"], len(models)
-    )
-    if note:
-        notes.append(note)
-    result = review.run_review(cfg, models, inp, focus, opts, notes)
+    result = review.run_pipeline(
+        cfg, list(args.get("models") or []), inp, focus, opts, notes)
     if args.get("format") == "json":
         return _ok(json.dumps(result, indent=2))
     return _ok(render.to_markdown(result))

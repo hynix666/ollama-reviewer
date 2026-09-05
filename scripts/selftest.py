@@ -816,11 +816,53 @@ def t_no_double_prefixed_locations():
     assert sep_named["location"] == "collect.py:7", sep_named["location"]
     return "prefixed once, named locations untouched"
 
+def t_pinned_timeout_is_not_scaled():
+    """An explicit --timeout must be honoured, not silently rescaled.
+
+    Regression guard: when timeout scaling moved behind the shared engine
+    entry point, the pin gate existed in the signature but not the body, so
+    a pinned --timeout was silently scaled anyway. The suite had never
+    driven this path; this check makes it permanent.
+    """
+    import fake_ollama
+
+    good = json.dumps(
+        {"findings": [{"line": 1, "severity": "high", "category": "correctness",
+                       "title": "t", "detail": "d", "suggestion": "s",
+                       "confidence": "high"}]})
+    scripts = {"fake:1b": [{"body": good}] * 3,
+               "fake:2b": [{"body": good}] * 3}
+    srv = fake_ollama.start(scripts)
+    try:
+        with _fake_host(srv.base_url), _tmpdir() as tmp:
+            target = os.path.join(tmp, "vuln.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("x = 1 + 2")
+            pinned = _capture_cli([
+                "review", "--file", target, "--json",
+                "--models", "fake:1b,fake:2b", "--timeout", "123"])
+            result = json.loads(pinned[1])
+            assert pinned[0] == 0 and result["status"] == "ok", pinned
+            assert not any(
+                "scaled" in n.lower() for n in result.get("notes", [])), result["notes"]
+            loose = _capture_cli([
+                "review", "--file", target, "--json",
+                "--models", "fake:1b,fake:2b"])
+            result2 = json.loads(loose[1])
+            assert loose[0] == 0 and result2["status"] == "ok", loose
+            assert any(
+                "scaled" in n.lower() for n in result2.get("notes", [])), result2["notes"]
+    finally:
+        srv.close()
+    return "explicit --timeout honoured; unpinned run scales"
+
+
 def t_timeout_scaling_is_shared():
     """CLI and MCP must apply the same timeout-scaling rule.
 
     Regression guard: only the CLI scaled the budget for multi-model runs, so
-    an MCP review with N models starved the later chunks.
+    an MCP review with N models starved the later chunks. Both front ends now
+    go through review.run_pipeline, the one assembly of resolve/scale/run.
     """
     assert review.scale_timeout_for_models(180, 1) == (180, None)
     t, note = review.scale_timeout_for_models(180, 3)
@@ -828,18 +870,20 @@ def t_timeout_scaling_is_shared():
     assert "540" in note and "3 models" in note, note
     here = os.path.dirname(os.path.abspath(__file__))
     mcp_src = open(os.path.join(here, "mcp_server.py"), encoding="utf-8").read()
-    assert "scale_timeout_for_models" in mcp_src, (
-        "mcp_server.py must use the shared helper")
+    assert "review.run_pipeline" in mcp_src, (
+        "mcp_server.py must go through the engine entry point")
     assert "import cli" not in mcp_src, (
         "mcp_server.py is a front end; it must not import another front end")
     cli_src = open(os.path.join(here, "cli.py"), encoding="utf-8").read()
-    assert "review.scale_timeout_for_models" in cli_src, (
-        "cli.py must scale through the engine's helper")
-    assert "def scale_timeout_for_models" not in cli_src, (
-        "the rule must have exactly one home: review.py")
-    assert "*= len(models)" not in cli_src, (
-        "cli.py must scale through the helper, not inline")
-    return "one rule, two front ends"
+    assert "review.run_pipeline" in cli_src, (
+        "cli.py must go through the engine entry point")
+    for front in (cli_src, mcp_src):
+        for symbol in ("resolve_models(", "scale_timeout_for_models(", "run_review("):
+            assert symbol not in front, (
+                "front ends must not bypass run_pipeline: %s" % symbol)
+    assert "def run_pipeline" in open(os.path.join(here, "review.py"), encoding="utf-8").read(), (
+        "the entry point must live in the engine")
+    return "one pipeline, two front ends"
 
 def t_conflicting_source_flags_fail():
     """Asking for two input sources is an error, never a silent priority.
@@ -1134,6 +1178,7 @@ def main():
         ("collect: untracked pipeline honest", t_untracked_honest_pipeline),
         ("collect: empty-diff bodies name skips", t_empty_diff_names_skips),
         ("review: tier 2 budget + tier 1 rescue", t_tier2_budget_and_tier1_rescue),
+        ("explicit --timeout is honoured", t_pinned_timeout_is_not_scaled),
         ("timeout scaling shared by cli and mcp", t_timeout_scaling_is_shared),
         ("collect+cli: conflicting sources fail loudly", t_conflicting_source_flags_fail),
         ("review: no double-prefixed locations", t_no_double_prefixed_locations),

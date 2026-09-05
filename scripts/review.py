@@ -173,6 +173,27 @@ def resolve_models(cfg, requested, notes):
     return models
 
 
+def run_pipeline(cfg, models, inp, focus, opts, notes,
+             timeout_pinned=False, timeout_note_suffix=""):
+    """One assembly of the review pipeline: resolve models, size the
+    budget for N models, and run.
+
+    Both front ends call this so resolve/scale/run has exactly one
+    landing place. Raises the engine's typed errors -- OllamaError and
+    ReviewFailure -- for each front end to translate for its transport.
+    InputError is not raised here: collect raises it upstream, already
+    typed, and it propagates through untouched.
+    """
+    models = resolve_models(cfg, list(models), notes)
+    if timeout_pinned:
+        note = None
+    else:
+        cfg["timeout_s"], note = scale_timeout_for_models(
+            cfg["timeout_s"], len(models))
+    if note:
+        notes.append(note + timeout_note_suffix)
+    return run_review(cfg, models, inp, focus, opts, notes)
+
 def _raw_finding(chunk, raw):
     """Tier 3: the model's unparseable output, preserved as an info finding."""
     return {

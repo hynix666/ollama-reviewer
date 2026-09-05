@@ -139,7 +139,7 @@ def cmd_review(args):
     else:
         requested = []
 
-    # ---- collect input, resolve models, run -----------------------------
+    # ---- collect input --------------------------------------------------
     try:
         code_only = not args.all_files
         if args.stdin:
@@ -154,28 +154,23 @@ def cmd_review(args):
     except collect.InputError as e:
         return fail(e.to_dict(), args.json, notes)
 
-    try:
-        models = review.resolve_models(cfg, requested, notes)
-    except oc.OllamaError as e:
-        return fail(e.to_dict(), args.json, notes)
-
-    # Engine policy lives in review.scale_timeout_for_models; the front end
-    # only decides whether the user set an explicit timeout.
-    if not explicit_timeout:
-        cfg["timeout_s"], note = review.scale_timeout_for_models(
-            cfg["timeout_s"], len(models)
-        )
-        if note:
-            notes.append(note + " Pass --timeout to override.")
-
     opts = review.ReviewOptions(
         adversarial=args.adversarial,
         instructions=args.instructions,
         temperature=args.temperature,
         debug=args.debug,
     )
+    # One engine entry point: resolve models, size the budget for N
+    # models (engine policy), run. The front end only says whether the
+    # user pinned the timeout explicitly.
     try:
-        result = review.run_review(cfg, models, inp, focus, opts, notes)
+        result = review.run_pipeline(
+            cfg, requested, inp, focus, opts, notes,
+            timeout_pinned=explicit_timeout,
+            timeout_note_suffix=" Pass --timeout to override.",
+        )
+    except oc.OllamaError as e:
+        return fail(e.to_dict(), args.json, notes)
     except review.ReviewFailure as e:
         return fail(e.error, args.json, notes)
 
