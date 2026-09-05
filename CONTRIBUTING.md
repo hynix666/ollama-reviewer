@@ -42,9 +42,10 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 62 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 58 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 65 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 61 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
+python scripts/selftest.py --mutate   # proves each regression guard has teeth
 ```
 
 CI runs `--offline` across Python 3.8–3.13 on Linux, Windows and macOS, plus a job

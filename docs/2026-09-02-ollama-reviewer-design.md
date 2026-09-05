@@ -261,7 +261,16 @@ bare elapsed time, so the spend can be read against what it was allowed.
 **The stdout discipline is the sharp edge.** A stdio MCP server may emit nothing
 but JSON-RPC frames; one stray `print` corrupts the stream and the client
 disconnects. Diagnostics therefore go to stderr, and a selftest check drives the
-protocol directly to keep that honest.
+protocol directly to keep that honest. The strongest of these (`mcp: stdio end
+to end`) spawns the real server process and scripts JSON-RPC frames over its
+actual stdin/stdout — initialize, a notification that must get no response,
+tools/list, and four tools/call (one single-model review, one two-model
+consensus with its corroboration tags pinned over the wire, one rejection, and
+one degraded consensus where one model fights the transport and the Degradations
+section must reach the tool result as a partial run) —
+pinning newline framing and the one-response-per-id lifecycle the
+in-process dispatch checks bypass; CI runs it as a named `mcp-stdio` job so a
+framing or lifecycle regression is its own red signal.
 
 Tool descriptions repeat that findings are advisory and must be verified — a
 check enforces this, because an MCP client sees only the description, never
@@ -306,7 +315,7 @@ respected exactly.
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
      +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
-     +-- mcp_server.py     MCP stdio server over the same engine      +-- selftest.py       62 checks, all error paths
+     +-- mcp_server.py     MCP stdio server over the same engine      +-- selftest.py       65 checks, all error paths
      +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
@@ -358,7 +367,21 @@ routes through) - the old silent precedence, where `--ref` outranked
 `{"ref": ""}`), which truthiness testing let slip past the guard. Every other
 flag composes: `--all-files` is a modifier, not a source, and applies to all
 five collection paths including piped stdin; focus, adversarial mode and
-instructions are orthogonal modifiers over whichever source won.
+instructions are orthogonal modifiers over whichever source won. Repeating
+a scalar override (`--model`, `--models`, `--ref`, `--cwd`, `--focus`,
+`--instructions`, `--temperature`, `--timeout`) is a parser-level error
+rather than a silent last-one-wins; repeating `--file` unions the paths. The MCP
+front end is held to the same loudness by validating every call against the
+very schema `tools/list` advertises - one source of truth, so enforcement
+cannot drift from advertisement. Wrongly-typed arguments (a string where an
+array is required, a string where a boolean is required, an unknown `format`),
+misspelled argument names, and unknown tools come back as tool errors instead
+of being silently reinterpreted (`list("m1,m2")` once became five
+one-character model names), a duplicated JSON key is a parse error at the
+stream seam instead of last-one-wins, and JSON null is accepted as "unset".
+Every tool failure rides back as a full MCP result (isError true, one text
+content part) - never a bare string, a partial dict, or an escaping exception
+- while protocol failures stay JSON-RPC errors; the two layers are never mixed.
 
 **Rejections, each with its own message:** missing paths, directories, binaries (by
 extension *and* null-byte probe), empty files, empty diffs, non-repositories,
@@ -411,14 +434,18 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 62 checks, 58 of them with no inference required: configuration loading,
+`selftest.py` runs 65 checks, 61 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the
 tier-2 budget/rescue ladder is proven over a real socket with controlled latency,
 and all three MCP review tools - including `ollama_review_file` - get real
 dispatch-level coverage offline. `--live` additionally reviews a fixture containing
-planted defects.
+planted defects. `--mutate` goes one level deeper: it applies registered
+byte-exact mutations - each breaking exactly one behavior - and requires the
+named checks to fail, restoring the source and clearing `__pycache__` after
+every mutation, so a guard that has quietly lost its grip fails CI loudly
+instead of passing forever.
 
 The suite proved its worth immediately by catching two real bugs in the
 implementation on its first run: the `0.0.0.0` connect failure (D6) and the health

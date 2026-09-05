@@ -32,19 +32,30 @@ EXIT_OK, EXIT_INPUT, EXIT_UNAVAILABLE, EXIT_TIMEOUT, EXIT_INTERNAL = 0, 2, 3, 4,
 
 class _Once(argparse.Action):
     """Store, but reject a second occurrence: argparse's silent overwrite
-    once reviewed one file when three were asked for. A repeated --model is
-    a contradiction (which model?), so it exits 2 at the parser - pointing
-    at the form that actually means "several models".
+    once reviewed one file when three were asked for. A repeated scalar
+    override is a contradiction - which value did the caller mean? - so it
+    exits 2 at the parser instead of one flag winning quietly. `hint`
+    names the form that does mean "several" (--models a,b), where one
+    exists. A per-destination seen-marker guards the check, not the value:
+    flags with value defaults (--cwd '.') must survive their first use.
     """
 
+    def __init__(self, option_strings, dest, hint=None, **kwargs):
+        self.hint = hint
+        super().__init__(option_strings, dest, **kwargs)
+
     def __call__(self, parser, namespace, values, option_string=None):
-        prev = getattr(namespace, self.dest, None)
-        if prev is not None:
+        marker = "_seen_%s" % self.dest
+        if getattr(namespace, marker, False):
+            prev = getattr(namespace, self.dest, None)
+            hint = self.hint if getattr(self, "hint", None) else ""
             parser.error(
-                "%s given more than once: %r then %r. Pass it once; several "
-                "models belong in --models a,b." % (option_string, prev, values)
+                "%s given more than once: %r then %r. Pass it once;%s"
+                % (option_string, prev, values, hint)
             )
         setattr(namespace, self.dest, values)
+        setattr(namespace, marker, True)
+
 
 ERROR_EXIT = {
     "unreachable": EXIT_UNAVAILABLE,
@@ -201,7 +212,7 @@ def build_parser():
     st = sub.add_parser(
         "status", parents=[common], help="check Ollama health and list models"
     )
-    st.add_argument("--model", help="model to test resolution for")
+    st.add_argument("--model", action=_Once, help="model to test resolution for")
     st.set_defaults(func=cmd_status)
 
     rv = sub.add_parser(
@@ -212,11 +223,13 @@ def build_parser():
         "--file", nargs="+", action="extend",
         help="explicit file paths; the flag may repeat and the paths union",
     )
-    src.add_argument("--ref", help="review the diff against this ref (REF...HEAD)")
+    src.add_argument("--ref", action=_Once,
+                     help="review the diff against this ref (REF...HEAD)")
     src.add_argument("--staged", action="store_true", help="review the staged diff")
     src.add_argument("--stdin", action="store_true", help="review piped input")
-    src.add_argument("--cwd", default=".", help="repository directory")
-    rv.add_argument("--focus", help="comma-separated: %s" % ",".join(prompts.FOCUS_AREAS))
+    src.add_argument("--cwd", action=_Once, default=".", help="repository directory")
+    rv.add_argument("--focus", action=_Once,
+                    help="comma-separated: %s" % ",".join(prompts.FOCUS_AREAS))
     rv.add_argument(
         "--all-files",
         action="store_true",
@@ -224,10 +237,14 @@ def build_parser():
         "lockfiles are skipped so the time budget goes to code",
     )
     rv.add_argument("--adversarial", action="store_true", help="adversarial design critique")
-    rv.add_argument("--instructions", help="extra steering, e.g. 'focus on the retry loop'")
-    rv.add_argument("--model", action=_Once, help="override the review model")
     rv.add_argument(
-        "--models",
+        "--instructions", action=_Once, help="extra steering, e.g. 'focus on the retry loop'"
+    )
+    rv.add_argument(
+        "--model", action=_Once, hint=" several models belong in --models a,b.",
+        help="override the review model")
+    rv.add_argument(
+        "--models", action=_Once, hint=" several models belong in --models a,b.",
         help="comma-separated models to review with; findings are reconciled "
         "across them and tagged with which models raised each one",
     )
@@ -236,8 +253,8 @@ def build_parser():
         action="store_true",
         help="review with the models in config.json's consensus_models",
     )
-    rv.add_argument("--temperature", type=float, help="override temperature")
-    rv.add_argument("--timeout", type=int, help="overall time budget in seconds")
+    rv.add_argument("--temperature", action=_Once, type=float, help="override temperature")
+    rv.add_argument("--timeout", action=_Once, type=int, help="overall time budget in seconds")
     rv.set_defaults(func=cmd_review)
     return p
 

@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-62 checks should pass (58 without a running Ollama server). Add `--live` to also run real inference against a file with
+65 checks should pass (61 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.8–3.13 on Linux,
 Windows and macOS.

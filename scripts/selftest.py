@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -205,11 +206,23 @@ def t_truncation():
     cfg = dict(cfg, max_file_chars=200)
     with _tmpdir() as tmp:
         p = os.path.join(tmp, "big.py")
+        raw = "x = 1\n" * 5000
         with open(p, "w", encoding="utf-8") as fh:
-            fh.write("x = 1\n" * 5000)
+            fh.write(raw)
         inp = collect.from_files(cfg, [p])
         assert inp.chunks[0].truncated, "oversized file should be marked truncated"
-        assert "TRUNCATED" in inp.chunks[0].text
+        capped = inp.chunks[0].text
+        assert "TRUNCATED" in capped
+        # The cut itself, not just the label: the marker's claimed "shown"
+        # count must match the configured cap and its "of" total the true
+        # source size, and the text really must be cap-sized - a
+        # pass-through cap would send the full file while claiming most of
+        # it was omitted.
+        m = re.search(r"\[TRUNCATED: (\d+) of (\d+) characters shown", capped)
+        assert m, capped[:80]
+        assert int(m.group(1)) == cfg["max_file_chars"], capped[-120:]
+        assert int(m.group(2)) == len(raw), capped[-120:]
+        assert len(capped) < cfg["max_file_chars"] + 500, len(capped)
         return "capped at %d chars" % cfg["max_file_chars"]
 
 
@@ -708,6 +721,307 @@ def t_mcp_dispatch_all_tools_on_fake():
         srv.close()
 
 
+def t_mcp_arguments_are_typed():
+    """MCP tool arguments are validated, not silently reinterpreted.
+
+    The CLI exits 2 at the parser for contradictory input (_Once, F7); the
+    MCP front end had no equivalent, so wrongly-typed JSON reached the
+    engine and was silently reinterpreted: models "m1,m2" became five
+    one-character model names via list(str), staged "yes" became True via
+    bool(str), format "yaml" rendered markdown anyway, and a duplicated
+    JSON key kept the last value (RFC 8259 leaves that choice open, so the
+    caller's stated intent is unknowable). Null counts as unset, which is
+    the same-as-absent behavior these arguments always had.
+    """
+
+    def err_of(name, args):
+        out = mcp_server.call_tool(name, args)
+        assert out["isError"] is True, out
+        return out["content"][0]["text"]
+
+    # The silent mangles, now loud. Wordings are schema-derived, so they
+    # speak the schema's vocabulary ("array", "JSON boolean").
+    e = err_of("ollama_review_code", {"code": "x = 1", "models": "m1,m2"})
+    assert "'models' must be an array" in e and "got str" in e, e
+    e = err_of("ollama_review_diff", {"cwd": ".", "staged": "yes"})
+    assert "'staged' must be a JSON boolean" in e, e
+    e = err_of("ollama_review_file", {"paths": "a.py"})
+    assert "'paths' must be an array" in e, e
+    e = err_of("ollama_review_code", {"code": "x = 1", "format": "yaml"})
+    assert "'format' must be one of 'markdown', 'json', got 'yaml'." in e, e
+    e = err_of("ollama_review_file", {"paths": [1, 2]})
+    assert "array of strings" in e, e
+    # A misspelled argument was once dropped without a trace (model vs
+    # models); now it names the miss and the valid set.
+    e = err_of("ollama_review_code", {"code": "x = 1", "model": "fake:1b"})
+    assert "unknown argument(s) model. Valid: " in e, e
+    # focus accepts a comma-separated string deliberately (resolve_focus).
+    e = err_of("ollama_review_code", {"code": "x = 1", "focus": "security,bogus"})
+    assert "Unknown focus area(s): bogus" in e, e
+    # arguments itself must be an object - the old `args or {}` made []
+    # indistinguishable from "no arguments".
+    e = err_of("ollama_review_file", [])
+    assert "must be a JSON object" in e, e
+
+    # null is unset, not an error: a well-formed call to a missing file
+    # still reaches the collector and fails with its own message.
+    out = mcp_server.call_tool(
+        "ollama_review_file",
+        {"paths": ["/definitely/not/here.py"], "models": None, "format": None},
+    )
+    assert out["isError"] is True, out
+    assert "No reviewable files" in out["content"][0]["text"], out
+
+    # Duplicate JSON keys are rejected at the parse seam (-32700), not
+    # last-one-wins; the response carries no id because the line never
+    # parsed.
+    line = (
+        '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":'
+        '{"name":"ollama_review_code","arguments":'
+        '{"code":"x","code":"y"}}}'
+    )
+    buf = io.StringIO()
+    mcp_server.serve(stdin=iter([line]), stdout=buf)
+    resp = json.loads(buf.getvalue())
+    assert "error" in resp and resp["error"]["code"] == -32700, (
+        "duplicated key must be a parse error, got: %s" % (buf.getvalue().strip(),))
+    assert resp["id"] is None and "Parse error" in resp["error"]["message"], resp
+
+    # The duplicate-key hook must not disturb well-formed traffic.
+    buf2 = io.StringIO()
+    mcp_server.serve(
+        stdin=iter(['{"jsonrpc":"2.0","id":1,"method":"ping"}']), stdout=buf2)
+    assert json.loads(buf2.getvalue()) == {"jsonrpc": "2.0", "id": 1, "result": {}}, (
+        buf2.getvalue())
+
+    return "wrong types loud; dup keys parse-error; null unset; ping still parses"
+
+
+def t_mcp_error_paths_keep_shape():
+    """Every error path returns the full content+isError shape - never a bare
+    string, a partial dict, or an escaping exception.
+
+    Clients branch on this shape, so it is a contract: tools/call failures
+    are MCP *results* (isError true, one text content part), protocol
+    failures are JSON-RPC *errors*, and the two are never mixed. Walks every
+    error path reachable offline: dispatcher rejections, argument
+    validation, collector rejections, a dead server (OllamaError), and an
+    unexpected exception via a patched collector to prove the catch-all.
+    Ok-path shapes are pinned by the fake-server dispatch check.
+    """
+
+    def shaped(out, expect_error=True):
+        # call_tool's contract: never raises, always the full shape.
+        assert isinstance(out, dict), "bare/partial return: %r" % (out,)
+        assert set(out) == {"content", "isError"}, sorted(out)
+        assert isinstance(out["isError"], bool), out["isError"]
+        assert out["isError"] is expect_error, out
+        assert isinstance(out["content"], list) and len(out["content"]) == 1, out
+        part = out["content"][0]
+        assert part.get("type") == "text", part
+        assert isinstance(part.get("text"), str) and part["text"].strip(), part
+        return part["text"]
+
+    # Dispatcher-level rejections - config load only, no server.
+    shaped(mcp_server.call_tool("no_such_tool", {}))
+    shaped(mcp_server.call_tool("ollama_review_file", []))    # args not an object
+    shaped(mcp_server.call_tool("ollama_review_file", {"model": "x"}))  # unknown arg
+    shaped(mcp_server.call_tool("ollama_review_file", {"paths": "a.py"}))  # wrong type
+    shaped(mcp_server.call_tool("ollama_review_file", {"paths": []}))  # nothing to review
+
+    # Collector rejection with a real (missing) path.
+    shaped(mcp_server.call_tool(
+        "ollama_review_file", {"paths": ["/definitely/not/here.py"]}))
+
+    with _tmpdir() as tmp:
+        target = os.path.join(tmp, "t.py")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("x = 1\n")
+
+        # Focus validation failure - reachable only past collection.
+        shaped(mcp_server.call_tool(
+            "ollama_review_file", {"paths": [target], "focus": "bogus"}))
+
+        # Dead server: the OllamaError path, host pinned to a refused port.
+        with _fake_host("http://127.0.0.1:9"):
+            shaped(mcp_server.call_tool(
+                "ollama_review_file", {"paths": [target]}))
+
+        # Unexpected exception: the collector blows up; the catch-all must
+        # still return the full shape instead of letting it escape.
+        orig = collect.from_files
+
+        def boom(*a, **k):
+            raise RuntimeError("boom")
+
+        collect.from_files = boom
+        try:
+            text = shaped(mcp_server.call_tool(
+                "ollama_review_file", {"paths": [target]}))
+            assert "Internal error" in text, text
+        finally:
+            collect.from_files = orig
+
+    # Tool failures ride in results, protocol failures in errors.
+    for args in ({}, {"arguments": "oops"}):
+        r = mcp_server.dispatch({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                                 "params": dict({"name": "no_such_tool"}, **args)})
+        assert r["jsonrpc"] == "2.0" and r["id"] == 5, r
+        assert "error" not in r, r          # a tool failure is NOT a protocol error
+        shaped(r["result"])
+    for msg_id, bad in ((6, {"method": "no/such"}),
+                        (7, {"method": "tools/call", "params": {}})):
+        r = mcp_server.dispatch(dict({"jsonrpc": "2.0", "id": msg_id}, **bad))
+        assert "result" not in r and r["id"] == msg_id, r
+        assert isinstance(r["error"]["code"], int) and r["error"]["message"], r
+
+    return "error paths full-shaped; tool-vs-protocol split pinned; catch-all proven"
+
+
+def t_mcp_stdio_end_to_end():
+    """The real mcp_server.py process, driven over stdio with JSON-RPC frames.
+
+    The in-process dispatch checks bypass serve() entirely - newline
+    framing, the stdin/stdout loop, and process lifecycle are only
+    exercised by spawning the server the way an MCP client does: requests
+    in, exactly one response line per id-ed request, silence for
+    notifications. The review tool calls run against the fake Ollama, so
+    this stays offline while covering the whole wire - including how
+    consensus corroboration tags render over it - and a degraded run where
+    one model fights the transport while the other succeeds.
+    """
+    import fake_ollama
+
+    finding = {
+        "severity": "high",
+        "category": "security",
+        "location": "1",
+        "issue": "hardcoded eval",
+        "why": "arbitrary code execution",
+        "suggested_fix": "remove the eval",
+    }
+    good = json.dumps({"findings": [finding]})
+    behaviors = [{"name": "review-ok", "body": good}]
+    # The fight recipe (mirrors t_degradation_notes_compress scenario 2):
+    # tier 1 answers prose, tier 2 dies with HTTP 500 - fake:2b degrades
+    # while fake:1b keeps succeeding, so the run is partial, not failed.
+    fight = [
+        {"name": "tier1-prose", "body": "I looked at the code. It is fine."},
+        {"name": "tier2-http500", "status": 500},
+    ]
+    srv = fake_ollama.start(
+        {"fake:1b": list(behaviors), "fake:2b": list(behaviors) + fight})
+    try:
+        with _tmpdir() as tmp:
+            target = os.path.join(tmp, "t.py")
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("import os\neval(os.getenv('X'))\n")
+
+            def frame(msg_id, method, params=None):
+                m = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+                if params is not None:
+                    m["params"] = params
+                return json.dumps(m) + "\n"
+
+            frames = [
+                frame(1, "initialize", {"protocolVersion": "2024-11-05"}),
+                # A notification: no id, and it must get no response line.
+                '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n',
+                frame(2, "tools/list"),
+                frame(3, "tools/call", {
+                    "name": "ollama_review_file",
+                    "arguments": {"paths": [target], "models": ["fake:1b"]},
+                }),
+                frame(4, "tools/call", {"name": "no_such_tool"}),
+                frame(5, "tools/call", {
+                    "name": "ollama_review_file",
+                    "arguments": {"paths": "t.py"},
+                }),
+                # Two models, identical findings -> corroborated over the wire.
+                frame(6, "tools/call", {
+                    "name": "ollama_review_file",
+                    "arguments": {"paths": [target],
+                                  "models": ["fake:1b", "fake:2b"]},
+                }),
+                # Same call, but fake:2b now fights the transport: a partial
+                # run whose Degradations section must reach the tool result.
+                frame(7, "tools/call", {
+                    "name": "ollama_review_file",
+                    "arguments": {"paths": [target],
+                                  "models": ["fake:1b", "fake:2b"]},
+                }),
+            ]
+            here = os.path.dirname(os.path.abspath(__file__))
+            proc = subprocess.run(
+                [sys.executable, os.path.join(here, "mcp_server.py")],
+                input="".join(frames), capture_output=True, text=True,
+                timeout=60, cwd=here,
+                env=dict(os.environ, OLLAMA_HOST=srv.base_url),
+            )
+            assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
+
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            assert len(lines) == 7, (
+                "expected 7 response lines (notification silent), got %d; "
+                "stdout=%r" % (len(lines), proc.stdout[:400]))
+            by_id = {}
+            for ln in lines:
+                r = json.loads(ln)
+                assert r["id"] is not None, r
+                by_id[r["id"]] = r
+
+            init = by_id[1]["result"]
+            assert init["serverInfo"]["name"] == "ollama-reviewer", init
+            tools = [t["name"] for t in by_id[2]["result"]["tools"]]
+            assert "ollama_review_file" in tools and len(tools) == 4, tools
+
+            ok = by_id[3]["result"]
+            assert ok["isError"] is False, ok
+            t3 = ok["content"][0]["text"]
+            assert "hardcoded eval" in t3, ok["content"][0]
+            # Single-model run: the model is named in the report title and
+            # no per-finding tag renders at all - raised_by only exists
+            # after multi-model reconciliation.
+            assert "# Local review - fake:1b" in t3, t3
+            assert "agreed by" not in t3, t3
+
+            bad = by_id[4]            # unknown tool: a result, never an error
+            assert "error" not in bad, bad
+            assert bad["result"]["isError"] is True, bad
+            assert "Unknown tool" in bad["result"]["content"][0]["text"], bad
+
+            typed = by_id[5]["result"]  # schema-derived rejection, pre-flight
+            assert typed["isError"] is True and "must be an array" in (
+                typed["content"][0]["text"]), typed
+
+            cons = by_id[6]["result"]   # two models -> corroboration tag
+            assert cons["isError"] is False, cons
+            t6 = cons["content"][0]["text"]
+            assert "agreed by fake:1b, fake:2b" in t6, t6[:500]
+            assert "After reconciling: **1 corroborated**" in t6, t6[:500]
+            assert "-- only " not in t6, t6[:500]
+
+            deg = by_id[7]["result"]    # one model fights -> partial, not error
+            assert deg["isError"] is False, (
+                "a partial run is a successful tool result")
+            t7 = deg["content"][0]["text"]
+            assert "## Degradations" in t7, t7[:500]
+            # The section proper: from the heading to the findings block.
+            section = t7.split("## Degradations")[1].split("\n### ")[0]
+            assert "(fake:2b): second pass failed (http_5xx)" in section, (
+                t7[:600])
+            # Finding tags stay out of the section; the surviving finding
+            # carries the lone-model tag on the wire.
+            assert "only fake:1b" not in section, section
+            assert "only fake:1b" in t7, t7[:600]
+            assert "Status: **partial**" in t7, t7[:600]
+    finally:
+        srv.close()
+
+    return ("spawned stdio server: 8 frames in, 7 responses out, clean, "
+            "consensus and degraded runs via fake ollama")
+
+
 def t_render_never_crashes():
     md = render.to_markdown({"status": "error", "error": {"detail": "d", "remedy": "r"}})
     assert "unavailable" in md.lower()
@@ -773,7 +1087,11 @@ def t_render_sorts_corroborated_first():
         "findings": merged, "elapsed_s": 1.0})
     first = md.split("### 1. ")[1].split("### 2. ")[0]
     assert "[HIGH]" in first and "agreed by" in first, first
-    assert "[CRITICAL]" in md.split("### 2. ")[1], "lone critical must come second"
+    second = md.split("### 2. ")[1]
+    assert "[CRITICAL]" in second, "lone critical must come second"
+    # The other tag branch: a finding only one model raised, inside a
+    # multi-model run, renders "only m1" - never the corroboration form.
+    assert "only m1" in second and "agreed by" not in second, second
     single = render.to_markdown({
         "status": "ok", "model": "m1", "input": {},
         "findings": [lone, agreed], "elapsed_s": 1.0})
@@ -1251,42 +1569,77 @@ def t_conflicting_source_flags_fail():
 
 
 def t_repeated_flags_neither_silent():
-    """Repeating --file unions; repeating --model is an error, not an overwrite.
+    """Repeating --file unions; repeating any scalar override exits 2.
 
     Regression guard: argparse's default store silently kept the last value,
     so `--file a.py --file b.py --file c.py` reviewed one file while exiting
-    0 - the same class of bug as the conflicting-sources guard above, just
-    quieter. --file gets the unambiguous reading (union of paths); --model
-    twice is a contradiction, so it fails at the parser pointing at
-    --models a,b, the form that actually means several models.
+    0, and any repeated override (--ref, --cwd, --timeout, ...) silently let
+    the last occurrence win - the same class of bug as the conflicting-sources
+    guard above, just quieter. The 2026-09 audit: booleans are idempotent and
+    stay plain; --file unions (a set of paths is unambiguous); every scalar
+    override uses _Once and exits 2 at the parser, naming the form that does
+    mean "several" where one exists.
     """
     from cli import build_parser
 
-    p = build_parser()
-    args = p.parse_args([
-        "review", "--file", "a.py", "b.py", "--file", "c.py"])
+    # --file repeats union: all paths survive, none dropped.
+    args = build_parser().parse_args(
+        ["review", "--file", "a.py", "b.py", "--file", "c.py"])
     assert args.file == ["a.py", "b.py", "c.py"], args.file
-    # All three paths must survive; argparse must not have kept only c.py.
-    assert "a.py" in args.file and "b.py" in args.file, args.file
 
-    twice = ["review", "--file", "a.py", "--model", "m1", "--model", "m2"]
-    try:
-        build_parser().parse_args(twice)
-        raise AssertionError("repeated --model parsed silently")
-    except SystemExit as e:
-        assert e.code == 2, "parser error must exit 2, got %s" % e.code
-    # The remedy names the form that means "several models".
-    with contextlib.redirect_stderr(io.StringIO()) as err:
-        code = 0
-        try:
-            build_parser().parse_args(twice)
-        except SystemExit:
-            pass
-    assert "--models a,b" in err.getvalue(), err.getvalue()
-    # Single use is untouched, and composes with --file repetition.
-    args2 = build_parser().parse_args(["review", "--file", "x.py", "--model", "m"])
-    assert args2.model == "m" and args2.file == ["x.py"], (args2.model, args2.file)
-    return "--file repeats union; repeated --model exits 2 naming --models a,b"
+    # Every scalar override rejects its second occurrence with exit 2 and a
+    # remedy, at the parser - before any server call. --models keeps its
+    # specific hint; the rest get the plain pass-it-once form. Each entry
+    # carries its full argv: splicing name.split() in front of the flags
+    # would put a second --flag token where its own value belongs.
+    twice = {
+        "review --model": (
+            ["review", "--model", "m1", "--model", "m2"], "--models a,b"),
+        "review --models": (
+            ["review", "--models", "a,b", "--models", "c,d"], "--models a,b"),
+        "status --model": (
+            ["status", "--model", "m1", "--model", "m2"], None),
+        "review --ref": (["review", "--ref", "HEAD~1", "--ref", "HEAD"], None),
+        "review --cwd": (
+            ["review", "--cwd", "somewhere", "--cwd", "elsewhere"], None),
+        "review --focus": (
+            ["review", "--focus", "security", "--focus", "logic"], None),
+        "review --instructions": (
+            ["review", "--instructions", "a", "--instructions", "b"], None),
+        "review --temperature": (
+            ["review", "--temperature", "0.2", "--temperature", "0.9"], None),
+        "review --timeout": (
+            ["review", "--timeout", "30", "--timeout", "90"], None),
+    }
+    for name, (argv, hint) in sorted(twice.items()):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = 0
+            try:
+                build_parser().parse_args(argv)
+            except SystemExit as e:
+                code = e.code
+        assert code == 2, "%s repeated must exit 2, got %s" % (name, code)
+        assert "given more than once" in err.getvalue(), (name, err.getvalue())
+        if hint:
+            assert hint in err.getvalue(), (name, err.getvalue())
+
+    # A value default (--cwd '.') must survive first use: the guard tracks
+    # occurrences per destination, never truthiness of the value itself.
+    assert build_parser().parse_args(["review", "--cwd", "d"]).cwd == "d"
+    assert build_parser().parse_args(["review"]).cwd == "."
+
+    # Booleans are idempotent - double --json is the documented ordering.
+    args_bool = build_parser().parse_args(
+        ["--json", "review", "--staged", "--staged", "--json"])
+    assert args_bool.json is True and args_bool.staged is True, (
+        args_bool.json, args_bool.staged)
+
+    # Single uses are untouched and compose.
+    args2 = build_parser().parse_args(
+        ["review", "--file", "x.py", "--model", "m", "--timeout", "10"])
+    assert (args2.model, args2.file, args2.timeout) == ("m", ["x.py"], 10), (
+        args2.model, args2.file, args2.timeout)
+    return "--file unions; 9 scalar flags exit 2 on repeat; booleans idempotent"
 
 
 def t_default_diff_includes_untracked():
@@ -1595,6 +1948,220 @@ def t_live_review():
 
 
 
+# Registered mutations for `--mutate`: each asserts that its checks have
+# teeth by breaking exactly one behavior and requiring the named checks to
+# fail. old must match the file byte for byte; new is the broken form; the
+# restore is the reverse substitution, in a finally, so a failed assertion
+# mid-mutation can never leave the tree dirty. After each restore the
+# module's __pycache__ is cleared: a same-size mutation-restore cycle can
+# land within one mtime second, and CPython's mtime+size pyc validation
+# would then serve the mutated bytecode as if the source were restored.
+MUTATIONS = [
+    {
+        "name": "repeated-flag guard removed",
+        "file": "cli.py",
+        "old": '''        if getattr(namespace, marker, False):
+            prev = getattr(namespace, self.dest, None)
+            hint = self.hint if getattr(self, "hint", None) else ""
+            parser.error(
+                "%s given more than once: %r then %r. Pass it once;%s"
+                % (option_string, prev, values, hint)
+            )
+''',
+        "new": "",
+        "checks": ["cli: repeated flags never silent"],
+    },
+    {
+        "name": "budget line removed from the header",
+        "file": "render.py",
+        "old": '    if budget_s:\n        spent += " of %ds budget" % budget_s\n',
+        "new": "",
+        "checks": ["render: budget shown in markdown"],
+    },
+    {
+        "name": "degradation compression skipped",
+        "file": "review.py",
+        "old": "    degraded = render.compress_degraded(degraded)\n",
+        "new": "",
+        "checks": ["review: degradation residue compresses"],
+    },
+    {
+        "name": "MCP argument type enforcement removed",
+        "file": "mcp_server.py",
+        "old": "        _check_types(name, args)\n",
+        "new": "",
+        "checks": ["mcp: tool arguments are typed"],
+    },
+    {
+        "name": "MCP duplicate-key parse guard removed",
+        "file": "mcp_server.py",
+        "old": "json.loads(line, object_pairs_hook=_no_duplicate_keys)",
+        "new": "json.loads(line)",
+        "checks": ["mcp: tool arguments are typed"],
+    },
+    {
+        "name": "MCP error shape broken (bare string from _err)",
+        "file": "mcp_server.py",
+        "old": 'def _err(text):\n    return {"content": [{"type": "text", "text": text}], "isError": True}',
+        "new": "def _err(text):\n    return text",
+        "checks": ["mcp: error paths keep the result shape"],
+    },
+    {
+        "name": "MCP catch-all removed",
+        "file": "mcp_server.py",
+        "old": '''    except Exception as e:  # never take the client down with us
+        sys.stderr.write(traceback.format_exc())
+        return _err("Internal error in the review server: %r" % (e,))
+''',
+        "new": "",
+        "checks": ["mcp: error paths keep the result shape"],
+    },
+    {
+        "name": "corroboration tag wording mangled",
+        "file": "render.py",
+        "old": '"agreed by %s" % ", ".join(f["raised_by"])',
+        "new": '"x-agreed %s" % ", ".join(f["raised_by"])',
+        "checks": ["render: corroborated first in markdown",
+                   "mcp: stdio end to end"],
+    },
+    {
+        "name": "lone-finding tag wording mangled",
+        "file": "render.py",
+        "old": 'else "only %s" % f["raised_by"][0]',
+        "new": 'else "lone %s" % f["raised_by"][0]',
+        "checks": ["render: corroborated first in markdown",
+                   "mcp: stdio end to end"],
+    },
+    {
+        "name": "degradations heading renamed",
+        "file": "render.py",
+        "old": '"## Degradations"',
+        "new": '"## Survival notes"',
+        "checks": ["render: degradations section", "mcp: stdio end to end"],
+    },
+    {
+        "name": "MCP dispatcher drops degradations",
+        "file": "mcp_server.py",
+        "old": '''    result = review.run_pipeline(
+        cfg, list(args.get("models") or []), inp, focus, opts, notes)
+''',
+        "new": '''    result = review.run_pipeline(
+        cfg, list(args.get("models") or []), inp, focus, opts, notes)
+    result = dict(result); result.pop("degradations", None)
+''',
+        "checks": ["mcp: stdio end to end"],
+    },
+    {
+        "name": "conflicting-sources guard disabled",
+        "file": "collect.py",
+        "old": "    if ref is not None and staged:\n",
+        "new": "    if False and ref is not None and staged:\n",
+        "checks": ["collect+cli: conflicting sources fail loudly"],
+    },
+    {
+        "name": "pinned --timeout scaled anyway",
+        "file": "review.py",
+        "old": "    if not timeout_pinned:\n",
+        "new": "    if True:\n",
+        "checks": ["explicit --timeout is honoured"],
+    },
+    {
+        "name": "per-chunk truncation cap removed",
+        "file": "collect.py",
+        "old": "    head = text[:limit]\n",
+        "new": "    head = text\n",
+        "checks": ["oversized input truncates"],
+    },
+    {
+        "name": "focus rejection wording changed",
+        "file": "prompts.py",
+        "old": '        return None, "Unknown focus area(s): %s. Valid: %s" % (\n',
+        "new": '        return None, "Unknown focus zones: %s. Valid: %s" % (\n',
+        "checks": ["orchestration + focus decoupled",
+                   "mcp: tool arguments are typed"],
+    },
+]
+
+
+def _clear_pycache():
+    """Drop compiled caches under scripts/ so the next import sees source.
+
+    mtime+size pyc validation can miss a same-size mutation-restore cycle
+    that lands within one mtime second.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cache = os.path.join(here, "__pycache__")
+    if os.path.isdir(cache):
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def _run_mutations():
+    """Prove every registered guard has teeth.
+
+    For each mutation: byte-exact restore in a finally, then a fresh
+    subprocess that asserts every named check fails under the mutation and
+    that the source is back. A passing baseline first, so a failure means a
+    loss of coverage, not a pre-existing break. All mutations run offline.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    argv = [sys.executable, os.path.abspath(__file__), "--offline"]
+    base = subprocess.run(argv, capture_output=True, text=True, timeout=900, cwd=here)
+    assert base.returncode == 0, "baseline suite must pass before mutating:\n%s" % (
+        base.stdout[-1500:],)
+    print("baseline: offline suite green\n")
+
+    bad = []
+    for mut in MUTATIONS:
+        path = os.path.join(here, mut["file"])
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            src = fh.read()
+        if mut["old"] not in src:
+            bad.append((mut["name"], "anchor no longer matches - update it"))
+            continue
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(src.replace(mut["old"], mut["new"], 1))
+            child_args = list(argv)
+            for c in mut["checks"]:
+                child_args += ["--mutate-check", c]
+            run = subprocess.run(
+                child_args,
+                capture_output=True, text=True, timeout=900, cwd=here)
+            # The runner prints "<name padded> STATUS <detail>"; recover
+            # exact check names (they contain spaces and colons, so split()
+            # is not an option - slice at the status word instead).
+            statuses = {}
+            for ln in run.stdout.splitlines():
+                m = re.search(r"\s(PASS|FAIL|SKIP)\s", ln)
+                if m:
+                    statuses[ln[:m.start()].strip()] = m.group(1)
+            got_bad = []
+            for want in mut["checks"]:
+                status = statuses.get(want, "not reported")
+                if status != "FAIL":
+                    got_bad.append("%s -> %s" % (want, status))
+            if got_bad:
+                bad.append((mut["name"], "; ".join(got_bad) + "\n  child tail: %r"
+                            % run.stdout[-300:]))
+        finally:
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(src)
+            _clear_pycache()
+
+        print("mutate: %-44s caught by %s" % (
+            mut["name"], ", ".join(c.split(":")[0] for c in mut["checks"])))
+
+    _clear_pycache()
+    print("\n" + "-" * 78)
+    if bad:
+        for name, why in bad:
+            print("MUTATION %s: %s" % (name, why))
+        print("%d of %d mutations NOT caught" % (len(bad), len(MUTATIONS)))
+        return 1
+    print("all %d mutations caught - every guard has teeth" % len(MUTATIONS))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="also run real inference")
@@ -1603,7 +2170,22 @@ def main():
         action="store_true",
         help="skip checks needing a live Ollama server (for CI)",
     )
+    ap.add_argument(
+        "--check", action="append", metavar="SUBSTR",
+        help="run only checks whose name contains this substring; may repeat. "
+        "Fails loudly when nothing matches, so CI cannot green-pass a typo",
+    )
+    ap.add_argument(
+        "--mutate", action="store_true",
+        help="apply registered mutations and require their checks to fail "
+        "(meta-verification that the guards have teeth; not part of the suite)",
+    )
+    ap.add_argument(
+        "--mutate-check", action="append", metavar="SUBSTR",
+        help=argparse.SUPPRESS)  # internal: used by _run_mutations' subprocess
     args = ap.parse_args()
+    if args.mutate:
+        return _run_mutations()
 
     checks = [
         ("config loads", t_config),
@@ -1644,6 +2226,9 @@ def main():
         ("mcp: tool schemas", t_mcp_tool_schemas),
         ("mcp: unknown tool", t_mcp_unknown_tool_is_error),
         ("mcp: all tools dispatched on fake ollama", t_mcp_dispatch_all_tools_on_fake),
+        ("mcp: tool arguments are typed", t_mcp_arguments_are_typed),
+        ("mcp: error paths keep the result shape", t_mcp_error_paths_keep_shape),
+        ("mcp: stdio end to end", t_mcp_stdio_end_to_end),
         ("render never crashes", t_render_never_crashes),
         ("prompts well-formed", t_prompt_shape),
         ("render: corroborated first in markdown", t_render_sorts_corroborated_first),
@@ -1670,6 +2255,13 @@ def main():
     if args.live:
         checks.append(("live review of planted defects", t_live_review))
     checks.append(("fixtures leave no temp residue", t_tempdir_leaves_no_residue))
+
+    if args.check or args.mutate_check:
+        needles = (args.check or []) + (args.mutate_check or [])
+        checks = [c for c in checks if any(s in c[0] for s in needles)]
+        if not checks:
+            print("no check matches: %s" % ", ".join(needles))
+            return 2
 
     for name, fn in checks:
         if args.offline and name in NEEDS_SERVER:

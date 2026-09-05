@@ -41,9 +41,10 @@ _FOCUS = sorted(prompts.FOCUS_AREAS)
 
 _COMMON_PROPS = {
     "focus": {
-        "type": "array",
+        "type": ["array", "string"],
         "items": {"type": "string", "enum": _FOCUS},
-        "description": "Areas to review. Defaults to all but 'design'.",
+        "description": "Areas to review, as a list or a comma-separated string. "
+        "Defaults to all but 'design'.",
     },
     "adversarial": {
         "type": "boolean",
@@ -70,7 +71,12 @@ _COMMON_PROPS = {
 def _schema(extra_props, required):
     props = dict(_COMMON_PROPS)
     props.update(extra_props)
-    return {"type": "object", "properties": props, "required": required}
+    return {
+        "type": "object",
+        "properties": props,
+        "required": required,
+        "additionalProperties": False,
+    }
 
 
 TOOLS = [
@@ -136,6 +142,16 @@ TOOLS = [
     },
 ]
 
+KNOWN_TOOLS = frozenset(t["name"] for t in TOOLS)
+
+
+def _schema_for(name):
+    """The advertised inputSchema for a tool, or None if unadvertised."""
+    for t in TOOLS:
+        if t["name"] == name:
+            return t.get("inputSchema")
+    return None
+
 
 def _ok(text):
     return {"content": [{"type": "text", "text": text}], "isError": False}
@@ -174,11 +190,75 @@ def _run(cfg, notes, inp, args):
     return _ok(render.to_markdown(result))
 
 
+_JSON_TYPES = {"string": (str,), "boolean": (bool,), "array": (list,), "number": (int, float)}
+_JSON_TYPE_NAMES = {"string": "a string", "boolean": "a JSON boolean", "array": "an array", "number": "a number"}
+
+
+def _check_types(name, args):
+    """Validate tool arguments against the very schema tools/list advertises.
+
+    One source of truth: rules are derived from TOOLS, so the advertised
+    schema and its enforcement cannot drift apart. The CLI exits 2 at the
+    parser for contradictory input (_Once, F7); the MCP front end has no
+    parser, so wrong-typed JSON used to be silently reinterpreted:
+    `models: "m1,m2"` became five one-character model names via list(str),
+    `staged: "yes"` became True via bool(str), and a misspelled argument
+    was dropped without a trace. JSON null is accepted everywhere as
+    "unset" - the same-as-absent behavior these arguments always had.
+    """
+    schema = _schema_for(name)
+    if schema is None:
+        return
+    unknown = sorted(set(args) - set(schema["properties"]))
+    if unknown:
+        raise ValueError(
+            "Tool %s: unknown argument(s) %s. Valid: %s."
+            % (name, ", ".join(unknown), ", ".join(sorted(schema["properties"]))))
+    for key, spec in schema["properties"].items():
+        value = args.get(key)
+        if value is None:
+            continue
+        allowed = spec.get("type")
+        kinds = [allowed] if isinstance(allowed, str) else list(allowed or [])
+        py = tuple(t for k in kinds for t in _JSON_TYPES.get(k, ()))
+        if py and not isinstance(value, py):
+            names = ", ".join(_JSON_TYPE_NAMES.get(k, k) for k in kinds)
+            raise ValueError(
+                "Tool %s: argument '%s' must be %s, got %s."
+                % (name, key, names, type(value).__name__))
+        if isinstance(value, list):
+            item = spec.get("items", {})
+            enums = item.get("enum")
+            for i in value:
+                if not isinstance(i, str):
+                    raise ValueError(
+                        "Tool %s: argument '%s' must be an array of strings; got %r."
+                        % (name, key, i))
+                if enums and i not in enums:
+                    raise ValueError(
+                        "Tool %s: argument '%s' has invalid value %r. Valid: %s."
+                        % (name, key, i, ", ".join(enums)))
+        enum = spec.get("enum")
+        if enum and value not in enum:
+            raise ValueError(
+                "Tool %s: argument '%s' must be one of %s, got %r."
+                % (name, key, ", ".join(map(repr, enum)), value))
+
+
 def call_tool(name, args):
     """Dispatch one tool call. Never raises; failures come back as isError."""
-    args = args or {}
+    args = {} if args is None else args
     cfg, notes = config.load_config()
     try:
+        if not isinstance(args, dict):
+            raise ValueError(
+                "Tool %s: 'arguments' must be a JSON object, got %s."
+                % (name, type(args).__name__))
+        if name not in KNOWN_TOOLS:
+            raise ValueError(
+                "Unknown tool: %s. Available: %s."
+                % (name, ", ".join(sorted(KNOWN_TOOLS))))
+        _check_types(name, args)
         if name == "ollama_list_models":
             return _ok(render.status_markdown(
                 oc.status_snapshot(cfg, None, notes))
@@ -264,6 +344,19 @@ def dispatch(msg):
     return error(-32601, "Method not found: %s" % method)
 
 
+def _no_duplicate_keys(pairs):
+    """json object_pairs_hook: a duplicated JSON key is ambiguous - RFC 8259
+    lets implementations pick any behavior, and Python's dict builder quietly
+    keeps the last (`{"staged": false, "staged": true}` would review staged
+    changes when the caller said not to). Reject instead: parse error."""
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError("duplicate object key: %r" % k)
+        out[k] = v
+    return out
+
+
 def serve(stdin=None, stdout=None):
     """Read newline-delimited JSON-RPC from stdin, write responses to stdout."""
     stdin = stdin or sys.stdin
@@ -273,7 +366,7 @@ def serve(stdin=None, stdout=None):
         if not line:
             continue
         try:
-            msg = json.loads(line)
+            msg = json.loads(line, object_pairs_hook=_no_duplicate_keys)
         except (ValueError, TypeError):
             out = {
                 "jsonrpc": "2.0",

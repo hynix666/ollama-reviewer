@@ -43,12 +43,34 @@ jobs:
       - name: Byte-compile all modules
         run: python -m compileall -q scripts
 
-      # --offline skips the three checks needing a live Ollama server; the
-      # remaining 58 cover error taxonomy, parsing, input validation, consensus
-      # ordering, context sizing, and a fake-Ollama E2E path, none of which
-      # need inference or network access.
+      # --offline skips the three checks needing a live Ollama server plus
+      # --live itself; the remaining 61 cover error taxonomy, parsing, input
+      # validation, consensus ordering, context sizing, a fake-Ollama E2E
+      # path, and an MCP stdio E2E path, none of which need inference or
+      # network access.
       - name: Self-test
         run: python scripts/selftest.py --offline
+
+  # The stdio E2E spawns the real mcp_server.py process and drives it with
+  # scripted JSON-RPC frames - initialize, a notification, tools/list, and
+  # tools/call (one review through the fake Ollama, one rejection) - the
+  # layer the in-process dispatch checks bypass. Kept as a named job so a
+  # framing/lifecycle regression shows up as its own red signal.
+  mcp-stdio:
+    name: mcp stdio end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Byte-compile all modules
+        run: python -m compileall -q scripts
+
+      - name: MCP checks incl. spawned-server stdio end-to-end
+        run: python scripts/selftest.py --offline --check mcp
 
   installers:
     name: installer syntax
