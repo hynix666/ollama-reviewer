@@ -15,19 +15,6 @@ SEVERITY_ICON = {
     "info": "[INFO]",
 }
 
-def human_size(n):
-    """Presentation helper: bytes to a short human string for status output."""
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return "%.0f%s" % (n, unit)
-        n /= 1024
-    return "%.1fTB" % n
-
-
 def sort_findings(findings):
     """Report order: the consensus key, shared with consensus.sort_merged.
 
