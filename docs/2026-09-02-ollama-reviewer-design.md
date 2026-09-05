@@ -239,7 +239,10 @@ The refactor in the previous change is what made this cheap. Because
 and returns a dict rather than printing, the server calls the engine in-process
 and formats the return value. Had the orchestration still lived inside
 `cmd_review`, this adapter would have had to shell out and parse its own CLI's
-output.
+output. Today both front ends go one step further and call the single
+engine entry point, `review.run_pipeline`, which owns resolve -> scale ->
+run; each adapter only translates the engine's typed errors for its own
+transport.
 
 **The stdout discipline is the sharp edge.** A stdio MCP server may emit nothing
 but JSON-RPC frames; one stray `print` corrupts the stream and the client
@@ -287,7 +290,7 @@ respected exactly.
      +-- collect.py        git diff / files / stdin -> validated chunks
      +-- prompts.py        system + user prompts, schema, focus policy
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
-     +-- review.py         tolerant parsing + models over chunks + assembly
+     +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
      +-- mcp_server.py     MCP stdio server over the same engine
      +-- selftest.py       52 checks, all error paths

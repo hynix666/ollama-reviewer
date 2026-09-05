@@ -820,7 +820,8 @@ def t_timeout_scaling_is_shared():
     """CLI and MCP must apply the same timeout-scaling rule.
 
     Regression guard: only the CLI scaled the budget for multi-model runs, so
-    an MCP review with N models starved the later chunks.
+    an MCP review with N models starved the later chunks. Both front ends now
+    go through review.run_pipeline, the one assembly of resolve/scale/run.
     """
     assert review.scale_timeout_for_models(180, 1) == (180, None)
     t, note = review.scale_timeout_for_models(180, 3)
@@ -828,18 +829,20 @@ def t_timeout_scaling_is_shared():
     assert "540" in note and "3 models" in note, note
     here = os.path.dirname(os.path.abspath(__file__))
     mcp_src = open(os.path.join(here, "mcp_server.py"), encoding="utf-8").read()
-    assert "scale_timeout_for_models" in mcp_src, (
-        "mcp_server.py must use the shared helper")
+    assert "review.run_pipeline" in mcp_src, (
+        "mcp_server.py must go through the engine entry point")
     assert "import cli" not in mcp_src, (
         "mcp_server.py is a front end; it must not import another front end")
     cli_src = open(os.path.join(here, "cli.py"), encoding="utf-8").read()
-    assert "review.scale_timeout_for_models" in cli_src, (
-        "cli.py must scale through the engine's helper")
-    assert "def scale_timeout_for_models" not in cli_src, (
-        "the rule must have exactly one home: review.py")
-    assert "*= len(models)" not in cli_src, (
-        "cli.py must scale through the helper, not inline")
-    return "one rule, two front ends"
+    assert "review.run_pipeline" in cli_src, (
+        "cli.py must go through the engine entry point")
+    for front in (cli_src, mcp_src):
+        for symbol in ("resolve_models(", "scale_timeout_for_models(", "run_review("):
+            assert symbol not in front, (
+                "front ends must not bypass run_pipeline: %s" % symbol)
+    assert "def run_pipeline" in open(os.path.join(here, "review.py"), encoding="utf-8").read(), (
+        "the entry point must live in the engine")
+    return "one pipeline, two front ends"
 
 def t_conflicting_source_flags_fail():
     """Asking for two input sources is an error, never a silent priority.
