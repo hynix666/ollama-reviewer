@@ -44,7 +44,7 @@ jobs:
         run: python -m compileall -q scripts
 
       # --offline skips the three checks needing a live Ollama server; the
-      # remaining 48 cover error taxonomy, parsing, input validation, consensus
+      # remaining 49 cover error taxonomy, parsing, input validation, consensus
       # ordering, context sizing, and a fake-Ollama E2E path, none of which
       # need inference or network access.
       - name: Self-test

@@ -48,6 +48,7 @@ def greet(user):
 
 RESULTS = []
 
+
 # Checks that need a live Ollama server. Everything else is pure logic or local
 # filesystem work, so CI can run the bulk of the suite without an inference server.
 NEEDS_SERVER = {
@@ -396,6 +397,35 @@ def _repo(commits=1, files=()):
                 fh.write(data if isinstance(data, bytes) else data.encode("utf-8"))
         yield tmp
 
+
+def _temp_entries():
+    """Names of the current entries in the OS temp dir."""
+    return set(os.listdir(tempfile.gettempdir()))
+
+# Temp-dir state before any fixture runs; t_tempdir_leaves_no_residue
+# (registry-last) compares against it.
+_TEMP_SNAPSHOT = _temp_entries()
+
+
+def t_tempdir_leaves_no_residue():
+    """Fixture cleanup must leave nothing behind in the OS temp dir.
+
+    Windows regression lock: git writes its loose object files read-only,
+    so a naive shutil.rmtree cannot remove a fixture repo (WinError 5).
+    _tmpdir has a second pass that chmods and re-removes; this check
+    snapshots the OS temp dir at import and fails if any new tmp-prefixed
+    directory survives the suite, empty shell or not (the Windows
+    residue is a populated repo with read-only objects). Concurrent
+    processes' temp churn could in principle trip it; CI is hermetic
+    and a re-run tells them apart instantly.
+    """
+    base = tempfile.gettempdir()
+    survivors = sorted(
+        d for d in _temp_entries() - _TEMP_SNAPSHOT
+        if d.startswith("tmp")
+        and os.path.isdir(os.path.join(base, d)))
+    assert not survivors, """fixture residue survived cleanup: %s""" % survivors
+    return """temp dir clean: no fixture residue survived"""
 
 def t_modules_stay_focused():
     """CONTRIBUTING promises modules stay near 400 lines; enforce it.
@@ -1111,6 +1141,7 @@ def main():
     ]
     if args.live:
         checks.append(("live review of planted defects", t_live_review))
+    checks.append(("fixtures leave no temp residue", t_tempdir_leaves_no_residue))
 
     for name, fn in checks:
         if args.offline and name in NEEDS_SERVER:
