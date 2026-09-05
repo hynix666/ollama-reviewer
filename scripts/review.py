@@ -320,7 +320,9 @@ def run_review(cfg, models, inp, focus, opts, notes):
     least one finding anywhere) is returned rather than raised, so a single
     dead model never discards the others' work. Fatal kinds (unreachable,
     model_missing, cloud_blocked) drop a model from the rest of the run;
-    transient kinds stay active so later chunks can retry.
+    transient kinds stay active so later chunks can retry. Degradations
+    are compressed before returning (see render.compress_degraded); each
+    failing chunk x model also lands in chunk_errors, on the wire.
     """
     started = time.time()
     deadline = started + cfg["timeout_s"]
@@ -355,9 +357,7 @@ def run_review(cfg, models, inp, focus, opts, notes):
                     ("input_possibly_truncated", None),
                 ):
                     if meta.get(key):
-                        degraded.append(
-                            "%s (%s): %s" % (chunk.label, model, fixed or meta[key])
-                        )
+                        degraded.append((chunk.label, model, fixed or meta[key]))
             except oc.OllamaError as e:
                 chunk_errors.append(
                     {"label": chunk.label, "model": model, "error": e.to_dict()}
@@ -368,6 +368,8 @@ def run_review(cfg, models, inp, focus, opts, notes):
                     notes.append("Dropped %s after a fatal error: %s" % (model, e.detail))
         if not active:
             break
+
+    degraded = render.compress_degraded(degraded)
 
     total = sum(len(fs) for fs in by_model.values())
     if not total and chunk_errors:
@@ -391,6 +393,7 @@ def run_review(cfg, models, inp, focus, opts, notes):
         "input": inp.summary(),
         "findings": merged,
         "chunk_errors": chunk_errors,
-        "notes": notes + degraded,
+        "notes": notes + degraded,  # echoes degradations for JSON consumers
+        "degradations": degraded,
         "error": None,
     }

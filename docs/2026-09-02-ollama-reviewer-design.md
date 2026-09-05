@@ -63,7 +63,13 @@ This is enforced by four mechanisms, not by good intentions:
    unavailable, `4` timeout, `5` internal). Every model failing on every chunk
    raises instead of exiting 0 - total loss is not "the review ran" - while a
    partial result (some findings survived) still exits 0 with `status:
-   "partial"` and `chunk_errors` naming what failed. If findings
+   "partial"` and `chunk_errors` naming what failed. Degradation notes
+   compress: identical messages repeated across chunks fold into one line
+   naming every affected chunk, so a transport fight reads once. In the
+   markdown report they render under a labeled "Degradations" section -
+   alongside the chunk failures - rather than as generic "Note:" bullets,
+   so what the run survived is visually distinct from front-end process
+   notes. If findings
    could fail the command, the model's opinion would become a gate — inverting the
    authority the design exists to protect.
 3. **The prompt demands falsifiable claims.** Every finding must name the concrete
@@ -248,7 +254,9 @@ engine entry point, `review.run_pipeline`, which owns resolve -> scale ->
 run; each adapter only translates the engine's typed errors for its own
 transport. The engine treats both its arguments as read-only - the scaled
 budget is applied to an engine-owned copy - and returns the budget
-decision and the full notes in the result dict.
+decision and the full notes in the result dict. Markdown shows that
+decision too: the report header reads "1.2s of 360s budget" rather than a
+bare elapsed time, so the spend can be read against what it was allowed.
 
 **The stdout discipline is the sharp edge.** A stdio MCP server may emit nothing
 but JSON-RPC frames; one stray `print` corrupts the stream and the client
@@ -298,8 +306,7 @@ respected exactly.
      +-- ollama_client.py  HTTP, error taxonomy, retries, context sizing
      +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
-     +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       58 checks, all error paths
+     +-- mcp_server.py     MCP stdio server over the same engine      +-- selftest.py       62 checks, all error paths
      +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
@@ -404,7 +411,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 58 checks, 55 of them with no inference required: configuration loading,
+`selftest.py` runs 62 checks, 58 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the

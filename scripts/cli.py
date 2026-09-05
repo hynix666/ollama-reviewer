@@ -29,6 +29,23 @@ import review  # noqa: E402
 
 EXIT_OK, EXIT_INPUT, EXIT_UNAVAILABLE, EXIT_TIMEOUT, EXIT_INTERNAL = 0, 2, 3, 4, 5
 
+
+class _Once(argparse.Action):
+    """Store, but reject a second occurrence: argparse's silent overwrite
+    once reviewed one file when three were asked for. A repeated --model is
+    a contradiction (which model?), so it exits 2 at the parser - pointing
+    at the form that actually means "several models".
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        prev = getattr(namespace, self.dest, None)
+        if prev is not None:
+            parser.error(
+                "%s given more than once: %r then %r. Pass it once; several "
+                "models belong in --models a,b." % (option_string, prev, values)
+            )
+        setattr(namespace, self.dest, values)
+
 ERROR_EXIT = {
     "unreachable": EXIT_UNAVAILABLE,
     "model_missing": EXIT_UNAVAILABLE,
@@ -191,7 +208,10 @@ def build_parser():
         "review", parents=[common], help="review a diff, files, or stdin"
     )
     src = rv.add_argument_group("input source")
-    src.add_argument("--file", nargs="+", help="explicit file paths")
+    src.add_argument(
+        "--file", nargs="+", action="extend",
+        help="explicit file paths; the flag may repeat and the paths union",
+    )
     src.add_argument("--ref", help="review the diff against this ref (REF...HEAD)")
     src.add_argument("--staged", action="store_true", help="review the staged diff")
     src.add_argument("--stdin", action="store_true", help="review piped input")
@@ -205,7 +225,7 @@ def build_parser():
     )
     rv.add_argument("--adversarial", action="store_true", help="adversarial design critique")
     rv.add_argument("--instructions", help="extra steering, e.g. 'focus on the retry loop'")
-    rv.add_argument("--model", help="override the review model")
+    rv.add_argument("--model", action=_Once, help="override the review model")
     rv.add_argument(
         "--models",
         help="comma-separated models to review with; findings are reconciled "

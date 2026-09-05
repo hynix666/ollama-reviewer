@@ -793,6 +793,69 @@ def t_status_renders_unresolved():
     assert "None" not in md.replace("(unresolved)", ""), "bare None leaked"
     return "status shows (unresolved), not None"
 
+
+def t_markdown_shows_budget():
+    """The markdown header shows the effective budget next to time spent.
+
+    Regression guard: run_pipeline's budget decision (result["timeout_s"])
+    was JSON-only; the markdown header showed elapsed time with nothing to
+    read it against, so "1.2s" could not be told from "1.2s of a 3600s one".
+    A result without the key (hand-made dicts, the error path) renders the
+    old bare header rather than "of None".
+    """
+    md = render.to_markdown({
+        "status": "ok", "model": "m", "input": {}, "findings": [],
+        "elapsed_s": 1.2, "timeout_s": 360})
+    assert "1.2s of 360s budget" in md, md[:400]
+    bare = render.to_markdown({
+        "status": "ok", "model": "m", "input": {}, "findings": [],
+        "elapsed_s": 1.2})
+    assert "of None" not in bare and "budget" not in bare, bare[:400]
+    assert "1.2s" in bare, bare[:400]
+    return "header reads '1.2s of 360s budget'; absent budget renders bare"
+
+
+def t_markdown_degradations_section():
+    """Degradations render under a labeled section, not generic Note bullets.
+
+    Regression guard: degradations and front-end notes shared one `notes`
+    list, so the report introduced everything as "- Note:" and a reader
+    could not tell what the run survived from what the front end did. The
+    engine now returns `degradations` separately; the section also folds in
+    chunk_errors, which used to be bare bullets. Old results without the
+    key keep rendering their notes as bullets.
+    """
+    base = {"status": "partial", "model": "m", "input": {}, "elapsed_s": 1.0}
+    md = render.to_markdown(dict(
+        base,
+        degradations=["msg (m) on 2 chunk(s): a.py, b.py"],
+        chunk_errors=[{"label": "a.py", "model": "m",
+                       "error": {"detail": "budget exhausted"}}],
+        notes=["Timeout scaled to 90s for 1 models.",
+               "msg (m) on 2 chunk(s): a.py, b.py"],
+        findings=[],
+    ))
+    assert "## Degradations" in md, md[:400]
+    # The section proper: heading up to the next block, not the whole tail.
+    section = md.split("## Degradations")[1].split("\n**")[0]
+    assert "- msg (m) on 2 chunk(s): a.py, b.py" in section, section
+    assert "- chunk `a.py` failed: budget exhausted" in section, section
+    # Process notes stay outside the labeled section; the engine's echoed
+    # degradation copy in notes is deduped, not doubled as a Note bullet.
+    assert "- Note: Timeout scaled" in md and "Timeout scaled" not in section, md[:400]
+    assert "- Note: msg (m)" not in md, md[:400]
+    # chunk_errors must not ALSO appear as a bare bullet anywhere.
+    assert md.count("failed: budget exhausted") == 1, md
+    # An old-shaped result (no degradations key) still renders its notes.
+    old = render.to_markdown(dict(
+        base, notes=["a process note"], findings=[]))
+    assert "- Note: a process note" in old and "## Degradations" not in old, old[:400]
+    # Neither key: clean render, no stray section.
+    empty = render.to_markdown(dict(base, findings=[]))
+    assert "Degradations" not in empty and "Note:" not in empty, empty[:400]
+    return "degradations labeled; chunk failures folded in; legacy shape intact"
+
+
 def t_no_double_prefixed_locations():
     """Bare locations get the chunk label once; file-naming ones do not.
 
@@ -948,8 +1011,12 @@ diff --git a/b.py b/b.py
         assert all(m == "fake:2b" for _, m in failing), failing
         assert not any("Dropped" in n for n in result["notes"]), result["notes"]
         md = render.to_markdown(result)
-        assert "Chunk `a.py` failed" in md, md[:600]
-        assert "Chunk `b.py` failed" in md, md[:600]
+        assert "## Degradations" in md, md[:600]
+        section = md.split("## Degradations")[1]
+        assert "- chunk `a.py` failed:" in section, section
+        assert "- chunk `b.py` failed:" in section, section
+        # Front-end process notes still render, outside the labeled section.
+        assert "- Note: Timeout scaled" in md, md[:600]
         assert all(r["model"] in ("fake:1b", "fake:2b") for r in srv.log)
     finally:
         srv.close()
@@ -1183,6 +1250,45 @@ def t_conflicting_source_flags_fail():
     return "conflicting sources rejected at both front ends, empty stated --ref included"
 
 
+def t_repeated_flags_neither_silent():
+    """Repeating --file unions; repeating --model is an error, not an overwrite.
+
+    Regression guard: argparse's default store silently kept the last value,
+    so `--file a.py --file b.py --file c.py` reviewed one file while exiting
+    0 - the same class of bug as the conflicting-sources guard above, just
+    quieter. --file gets the unambiguous reading (union of paths); --model
+    twice is a contradiction, so it fails at the parser pointing at
+    --models a,b, the form that actually means several models.
+    """
+    from cli import build_parser
+
+    p = build_parser()
+    args = p.parse_args([
+        "review", "--file", "a.py", "b.py", "--file", "c.py"])
+    assert args.file == ["a.py", "b.py", "c.py"], args.file
+    # All three paths must survive; argparse must not have kept only c.py.
+    assert "a.py" in args.file and "b.py" in args.file, args.file
+
+    twice = ["review", "--file", "a.py", "--model", "m1", "--model", "m2"]
+    try:
+        build_parser().parse_args(twice)
+        raise AssertionError("repeated --model parsed silently")
+    except SystemExit as e:
+        assert e.code == 2, "parser error must exit 2, got %s" % e.code
+    # The remedy names the form that means "several models".
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        code = 0
+        try:
+            build_parser().parse_args(twice)
+        except SystemExit:
+            pass
+    assert "--models a,b" in err.getvalue(), err.getvalue()
+    # Single use is untouched, and composes with --file repetition.
+    args2 = build_parser().parse_args(["review", "--file", "x.py", "--model", "m"])
+    assert args2.model == "m" and args2.file == ["x.py"], (args2.model, args2.file)
+    return "--file repeats union; repeated --model exits 2 naming --models a,b"
+
+
 def t_default_diff_includes_untracked():
     """The default review must see never-added files, and say so.
 
@@ -1357,6 +1463,107 @@ def t_tier2_budget_and_tier1_rescue():
         srv.close()
     return "budget inherited, tier-1 text rescued (over the wire)"
 
+
+def t_degradation_notes_compress():
+    """Identical degradation notes fold into one line naming the chunks.
+
+    Regression guard: run_review appended one note per chunk x model, so a
+    model fighting the transport repeated the same sentence once per chunk
+    and the report drowned its findings in copies of it. Compression keyed
+    on (model, message) keeps every chunk and model named; a singleton
+    keeps the exact per-chunk wording. Compressed degradations travel in
+    result["degradations"] and reach the report's labeled section.
+
+    Wire setup mirrors t_tier2_budget_and_tier1_rescue scenario 2: tier 1
+    answers prose (never parses), tier 2 dies with HTTP 500 - the chunk's
+    rescue meta carries the identical transport-fight message.
+    """
+    import fake_ollama
+
+    prose = "the model wrote prose, not JSON"
+    diff = """diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1 +1 @@
+-x
++y
+diff --git a/b.py b/b.py
+--- a/b.py
++++ b/b.py
+@@ -1 +1 @@
+-x
++y
+diff --git a/c.py b/c.py
+--- a/c.py
++++ b/c.py
+@@ -1 +1 @@
+-x
++y
+diff --git a/d.py b/d.py
+--- a/d.py
++++ b/d.py
+@@ -1 +1 @@
+-x
++y
+"""
+    srv = fake_ollama.start({"m": [
+        {"name": "a-t1", "body": prose},
+        {"name": "a-t2", "status": 500},
+        {"name": "b-t1", "body": prose},
+        {"name": "b-t2", "status": 500},
+        {"name": "c-t1", "body": prose},
+        {"name": "c-t2", "status": 500},
+        # d.py degrades differently: both tiers answer prose, so tier 3
+        # surfaces it - a distinct message, never grouped with the fights.
+        {"name": "d-t1", "body": prose},
+        {"name": "d-t2", "body": prose},
+    ]})
+    try:
+        cfg, _ = config.load_config()
+        cfg = dict(cfg, base_url=srv.base_url, max_retries=1)
+        inp = collect.from_text(cfg, diff, "ignored", "stdin")
+        labels = [c.label for c in inp.chunks]
+        assert labels == ["a.py", "b.py", "c.py", "d.py"], labels
+        notes = []
+        result = review.run_pipeline(
+            cfg, ["m"], inp, prompts.DEFAULT_FOCUS,
+            review.ReviewOptions(), notes)
+        assert result["status"] == "partial", result["status"]
+        # The engine's degraded entries: compressed, chunk_errors excluded.
+        degs = result["degradations"]
+        assert len(degs) == 2, degs
+        # The identical transport fights fold into one line naming every
+        # affected chunk and the model; no per-chunk copy may survive.
+        fights = [n for n in degs if "second pass failed" in n]
+        assert len(fights) == 1, degs
+        assert "http_5xx" in fights[0] and "(m)" in fights[0], degs
+        assert "on 3 chunk(s)" in fights[0], degs
+        for label in labels[:-1]:
+            assert label in fights[0], (label, fights)
+        assert "d.py" not in fights[0], degs
+        # The distinct tier-3 degradation keeps the singleton's exact
+        # per-chunk wording, model and all.
+        clean = [n for n in degs if "output was not parseable" in n]
+        assert clean == ["d.py (m): output was not parseable as JSON; "
+                         "surfaced as raw text"], degs
+        # Back-compat: notes still carries the degradation lines for JSON
+        # consumers, after the front-end notes.
+        assert result["notes"][-2:] == degs, (result["notes"], degs)
+        md = render.to_markdown(result)
+        assert "## Degradations" in md, md[:400]
+        section = md.split("## Degradations")[1]
+        assert fights[0] in section and clean[0] in section, section
+        # Every tier-2 failure was rescued here, so chunk_errors is empty
+        # and no "chunk ... failed" line may appear in the section. (The
+        # fight line itself says "second pass failed", so grep the shape.)
+        assert "chunk `" not in section, section
+        # All notes in this run are degradation echoes; the dedup must
+        # leave no duplicated Note bullets behind.
+        assert "- Note:" not in md, md[:600]
+    finally:
+        srv.close()
+    return "identical rescue notes fold into one line; singleton keeps its wording"
+
 # --------------------------------------------------------------------------
 # live inference
 # --------------------------------------------------------------------------
@@ -1445,6 +1652,7 @@ def main():
         ("collect: untracked pipeline honest", t_untracked_honest_pipeline),
         ("collect: empty-diff bodies name skips", t_empty_diff_names_skips),
         ("review: tier 2 budget + tier 1 rescue", t_tier2_budget_and_tier1_rescue),
+        ("review: degradation residue compresses", t_degradation_notes_compress),
         ("review: all chunks failed is an error", t_all_chunks_failed_is_an_error),
         ("review: partial run keeps surviving findings", t_partial_run_keeps_surviving_findings),
         ("review: fatal drop leaves others running", t_fatal_drop_does_not_kill_the_run),
@@ -1455,6 +1663,9 @@ def main():
         ("collect+cli: conflicting sources fail loudly", t_conflicting_source_flags_fail),
         ("review: no double-prefixed locations", t_no_double_prefixed_locations),
         ("status: unresolved renders, not None", t_status_renders_unresolved),
+        ("render: budget shown in markdown", t_markdown_shows_budget),
+        ("render: degradations section", t_markdown_degradations_section),
+        ("cli: repeated flags never silent", t_repeated_flags_neither_silent),
     ]
     if args.live:
         checks.append(("live review of planted defects", t_live_review))

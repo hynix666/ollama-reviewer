@@ -15,6 +15,41 @@ SEVERITY_ICON = {
     "info": "[INFO]",
 }
 
+def compress_degraded(entries):
+    """Fold identical degradation notes into one line naming the chunks.
+
+    When several chunks hit the same failure - the common case is a model
+    fighting the transport, where tier 2 dies the same way on every chunk -
+    one note per chunk drowns the report in copies of the same sentence.
+    The (model, message) pair is the group key, so nothing is lost: every
+    affected chunk and model still appears by name. A singleton keeps the
+    exact per-chunk wording, so a lone degradation reads exactly as before.
+
+    `entries` are (chunk_label, model, message) tuples as collected by
+    review.run_review; report wording belongs here, the engine stays
+    presentation-free.
+    """
+    by_group = {}
+    order = []
+    for label, model, msg in entries:
+        key = (model, msg)
+        if key not in by_group:
+            by_group[key] = []
+            order.append(key)
+        by_group[key].append(label)
+    out = []
+    for model, msg in order:
+        labels = by_group[(model, msg)]
+        if len(labels) == 1:
+            out.append("%s (%s): %s" % (labels[0], model, msg))
+        else:
+            out.append(
+                "%s (%s) on %d chunk(s): %s"
+                % (msg, model, len(labels), ", ".join(labels))
+            )
+    return out
+
+
 def sort_findings(findings):
     """Report order: the consensus key, shared with consensus.sort_merged.
 
@@ -49,15 +84,22 @@ def to_markdown(result):
     agreement = result.get("agreement")
     models = result.get("models") or [result.get("model") or "?"]
     title = models[0] if len(models) == 1 else "%d models" % len(models)
+    # The engine's budget decision travels in the result; show it so "1.2s"
+    # can be read against what it was allowed to spend. Absent (hand-made
+    # dicts, the error path) the header keeps its old shape.
+    budget_s = result.get("timeout_s")
+    spent = "%.1fs" % result.get("elapsed_s", 0.0)
+    if budget_s:
+        spent += " of %ds budget" % budget_s
     lines += [
         "# Local review - %s" % title,
         "",
-        "%s | %s chunk(s), %s chars | %.1fs"
+        "%s | %s chunk(s), %s chars | %s"
         % (
             inp.get("kind", "?"),
             inp.get("chunks", "?"),
             inp.get("chars", "?"),
-            result.get("elapsed_s", 0.0),
+            spent,
         ),
         "",
     ]
@@ -75,17 +117,28 @@ def to_markdown(result):
             "",
         ]
 
+    # Front-end process notes first; then a labeled Degradations section
+    # naming what the run itself survived - chunk_errors folded in. The
+    # engine echoes degradations into notes for JSON consumers; rendering
+    # both would duplicate every line, and a single blank line would let
+    # the Note bullets read as a continuation of the section's list.
+    degradations = list(result.get("degradations") or [])
+    for ce in result.get("chunk_errors") or []:
+        degradations.append("chunk `%s` failed: %s" % (ce["label"], ce["error"]["detail"]))
     for note in result.get("notes", []):
+        if degradations and note in degradations:
+            continue
         lines.append("- Note: %s" % note)
     for warn in inp.get("warnings", []):
         lines.append("- Warning: %s" % warn)
     for sk in inp.get("skipped", []):
         lines.append("- Skipped `%s` (%s)" % (sk["path"], sk["reason"]))
-    if result.get("chunk_errors"):
-        for ce in result["chunk_errors"]:
-            lines.append(
-                "- Chunk `%s` failed: %s" % (ce["label"], ce["error"]["detail"])
-            )
+    if degradations:
+        if lines[-1] != "":
+            lines.append("")
+        lines += ["## Degradations", ""]
+        for d in degradations:
+            lines.append("- %s" % d)
     if lines[-1] != "":
         lines.append("")
 
