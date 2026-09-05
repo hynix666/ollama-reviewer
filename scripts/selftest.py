@@ -857,6 +857,55 @@ def t_pinned_timeout_is_not_scaled():
     return "explicit --timeout honoured; unpinned run scales"
 
 
+def t_status_snapshot_is_shared():
+    """Both front ends must build status through one engine snapshot.
+
+    The payload assembly (model table, human sizes, resolution notes)
+    used to live twice, once per front end, and could drift. It now has
+    one home beside the raw material it shapes.
+    """
+    import fake_ollama
+
+    srv = fake_ollama.start({"fake:1b": [{"body": "{}"}]})
+    try:
+        with _fake_host(srv.base_url):
+            hit = _capture_cli(["status", "--json", "--model", "fake:1b"])
+            hit_data = json.loads(hit[1])
+            assert hit[0] == 0 and hit_data["status"] == "ok", hit
+            assert hit_data["resolved_model"] == "fake:1b", hit_data
+            assert hit_data["models"] and all(
+                "size_h" in m and "context" in m for m in hit_data["models"]), (
+                hit_data["models"])
+            miss = _capture_cli(["status", "--json", "--model", "ghost:7b"])
+            miss_data = json.loads(miss[1])
+            assert miss[0] == 0 and miss_data["status"] == "ok", miss
+            assert miss_data["resolved_model"] is None, miss_data
+            assert any(
+                "ghost:7b" in n for n in miss_data.get("notes", [])), miss_data["notes"]
+            out = mcp_server.call_tool("ollama_list_models", {})
+            assert out["isError"] is not True, out
+            assert "fake:1b" in out["content"][0]["text"], out["content"][0]["text"]
+    finally:
+        srv.close()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for front in ("cli.py", "mcp_server.py"):
+        src = open(os.path.join(here, front), encoding="utf-8").read()
+        assert "status_snapshot(" in src, (
+            front + " must build status through the engine snapshot")
+        for symbol in ("human_size(", "base_url", "configured_model"):
+            assert symbol not in src, (
+                front + " must not assemble the status payload itself: " + symbol)
+    assert "def status_snapshot" in open(
+        os.path.join(here, "ollama_client.py"), encoding="utf-8").read(), (
+        "the snapshot must live in the engine client layer")
+    assert "def human_size" in open(
+        os.path.join(here, "ollama_client.py"), encoding="utf-8").read()
+    assert "def human_size" not in open(
+        os.path.join(here, "render.py"), encoding="utf-8").read(), (
+        "human_size is a status-payload concern now, not a renderer")
+    return "one snapshot, two front ends, both paths pinned"
+
+
 def t_timeout_scaling_is_shared():
     """CLI and MCP must apply the same timeout-scaling rule.
 
@@ -1179,6 +1228,7 @@ def main():
         ("collect: empty-diff bodies name skips", t_empty_diff_names_skips),
         ("review: tier 2 budget + tier 1 rescue", t_tier2_budget_and_tier1_rescue),
         ("explicit --timeout is honoured", t_pinned_timeout_is_not_scaled),
+        ("status snapshot shared by cli and mcp", t_status_snapshot_is_shared),
         ("timeout scaling shared by cli and mcp", t_timeout_scaling_is_shared),
         ("collect+cli: conflicting sources fail loudly", t_conflicting_source_flags_fail),
         ("review: no double-prefixed locations", t_no_double_prefixed_locations),

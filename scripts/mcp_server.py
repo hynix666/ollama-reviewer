@@ -180,32 +180,9 @@ def call_tool(name, args):
     cfg, notes = config.load_config()
     try:
         if name == "ollama_list_models":
-            installed = oc.list_models(cfg)
-            resolved = None
-            try:
-                resolved, rnotes = oc.resolve_model(cfg, None, {
-                    m.get("name") for m in installed if m.get("name")
-                })
-                notes += rnotes
-            except oc.OllamaError as e:
-                notes.append("%s %s" % (e.detail, e.remedy))
-            payload = {
-                "status": "ok",
-                "base_url": cfg["base_url"],
-                "configured_model": cfg["model"],
-                "resolved_model": resolved,
-                "fallback_models": cfg.get("fallback_models"),
-                "notes": notes,
-                "models": [
-                    {
-                        "name": m.get("name"),
-                        "size_h": render.human_size(m.get("size")),
-                        "context": (m.get("details") or {}).get("context_length", "?"),
-                    }
-                    for m in sorted(installed, key=lambda x: x.get("name") or "")
-                ],
-            }
-            return _ok(render.status_markdown(payload))
+            return _ok(render.status_markdown(
+                oc.status_snapshot(cfg, None, notes))
+            )
 
         if name == "ollama_review_file":
             paths = args.get("paths") or []

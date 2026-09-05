@@ -58,33 +58,9 @@ def fail(error_dict, as_json, notes=None, markdown_fn=render.to_markdown):
 def cmd_status(args):
     cfg, notes = config.load_config()
     try:
-        models = oc.list_models(cfg)
+        payload = oc.status_snapshot(cfg, args.model, notes)
     except oc.OllamaError as e:
         return fail(e.to_dict(), args.json, notes, render.status_markdown)
-
-    names = {m.get("name") for m in models if m.get("name")}
-    resolved, rnotes = None, []
-    try:
-        resolved, rnotes = oc.resolve_model(cfg, args.model, names)
-    except oc.OllamaError as e:
-        notes.append("%s %s" % (e.detail, e.remedy))
-
-    payload = {
-        "status": "ok",
-        "base_url": cfg["base_url"],
-        "configured_model": cfg["model"],
-        "resolved_model": resolved,
-        "fallback_models": cfg.get("fallback_models"),
-        "notes": notes + rnotes,
-        "models": [
-            {
-                "name": m.get("name"),
-                "size_h": render.human_size(m.get("size")),
-                "context": (m.get("details") or {}).get("context_length", "?"),
-            }
-            for m in sorted(models, key=lambda x: x.get("name") or "")
-        ],
-    }
     emit(payload, args.json, render.status_markdown)
     return EXIT_OK
 

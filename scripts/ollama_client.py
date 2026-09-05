@@ -214,6 +214,55 @@ def resolve_model(cfg, requested, available_names):
         % ", ".join(c for c in candidates if c),
         "Install one with: ollama pull %s\nInstalled: %s" % (candidates[0], installed),
     )
+def human_size(n):
+    """Presentation helper: bytes to a short human string for status output."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return "%.0f%s" % (n, unit)
+        n /= 1024
+    return "%.1fTB" % n
+
+
+def status_snapshot(cfg, requested, notes):
+    """One home for the status payload both front ends emit.
+
+    Lists the installed models with human-sized download figures and
+    context lengths, resolves the effective review model (requested
+    overrides config; a miss becomes a note, never an error), and
+    returns the payload dict render.status_markdown and JSON views share.
+    Raises OllamaError only when the server itself is unreachable.
+    """
+    models = list_models(cfg)
+    resolved = None
+    try:
+        resolved, rnotes = resolve_model(
+            cfg, requested, {m.get("name") for m in models if m.get("name")})
+    except OllamaError as e:
+        notes.append("%s %s" % (e.detail, e.remedy))
+    else:
+        notes.extend(rnotes)
+    return {
+        "status": "ok",
+        "base_url": cfg["base_url"],
+        "configured_model": cfg["model"],
+        "resolved_model": resolved,
+        "fallback_models": cfg.get("fallback_models"),
+        "notes": notes,
+        "models": [
+            {
+                "name": m.get("name"),
+                "size_h": human_size(m.get("size")),
+                "context": (m.get("details") or {}).get("context_length", "?"),
+            }
+            for m in sorted(models, key=lambda x: x.get("name") or "")
+        ],
+    }
+
+
 
 
 CTX_MIN = 8192

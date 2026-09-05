@@ -293,7 +293,7 @@ respected exactly.
      +-- review.py         tolerant parsing + models over chunks + pipeline entry
      +-- render.py         Markdown rendering of results (presentation only)
      +-- mcp_server.py     MCP stdio server over the same engine
-     +-- selftest.py       53 checks, all error paths
+     +-- selftest.py       54 checks, all error paths
      +-- fake_ollama.py    scripted fake server for offline E2E
      +-- consensus.py      cross-model reconciliation of findings
 ```
@@ -398,7 +398,7 @@ rule in force.
 
 ## 9. Testing
 
-`selftest.py` runs 53 checks, 50 of them with no inference required: configuration loading,
+`selftest.py` runs 54 checks, 51 of them with no inference required: configuration loading,
 connectivity, model resolution (including bare family names), all six error classes,
 input rejections, truncation, the three parser tiers, context sizing, and render
 safety. `fake_ollama.py` is a stdlib-only scripted fake Ollama HTTP server, so the
