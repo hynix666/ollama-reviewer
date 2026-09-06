@@ -19,6 +19,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+# No dependency cache: the suite is pure standard library - no pip install,
+# no requirements file (README: "no pip install, no dependencies") - so there
+# is nothing to cache and an actions/cache step would only add a round-trip
+# and a third-party action to the supply chain. If a dependency is ever
+# added, cache it here keyed on the requirements hash, and extend the
+# pinning policy: the cache action is third-party code like any other and
+# gets pinned to a release SHA.
+
 jobs:
   test:
     name: ${{ matrix.os }} · py${{ matrix.python }}
