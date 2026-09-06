@@ -48,8 +48,9 @@ python scripts/selftest.py --live     # adds real inference on planted defects
 python scripts/selftest.py --mutate   # proves each regression guard has teeth
 ```
 
-CI runs `--offline` across Python 3.8–3.13 on Linux, Windows and macOS, plus a job
-that syntax-checks both installers. All jobs must pass before a merge.
+CI runs `--offline` across Python 3.9–3.13 on Linux, Windows and macOS, byte-compiles
+the sources on Python 3.8 (the floor badge, not the suite), and syntax-checks both
+installers. All jobs must pass before a merge.
 
 ## Two hard rules
 
@@ -57,8 +58,9 @@ that syntax-checks both installers. All jobs must pass before a merge.
 installs by cloning, and adding a dependency breaks that. `urllib.request` is
 verbose but sufficient.
 
-**Python 3.8 is the floor.** CI enforces it, so these will fail the build rather
-than slip through:
+**Python 3.8 is the floor.** The 3.8 CI job byte-compiles every module, so 3.9+
+*syntax* fails the build; runtime-only 3.9-isms (like `dict | dict`) no longer
+execute on 3.8, so those land on review. Avoid:
 
 | Avoid | Since | Use instead |
 |---|---|---|
