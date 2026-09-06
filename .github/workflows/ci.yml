@@ -10,9 +10,13 @@ on:
 # narrowest permissions it needs; a compromised dependency in one job
 # cannot read or write what that job does not use.
 
-# A newer push supersedes an in-flight run on the same ref.
+# Concurrency is namespaced three ways: by workflow (so another workflow's
+# runs can never share this group), by event type (a push to a branch and a
+# pull_request run for that branch are distinct streams - neither cancels
+# the other mid-run), and by ref (so only a newer run of the same event on
+# the same ref supersedes an older one). Within a namespace, newest wins.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
