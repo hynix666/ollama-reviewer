@@ -227,6 +227,7 @@ MUTATION_SENSITIVE = {
     "orchestration + focus decoupled",
     "dashboard: watcher pidfile lock",
     "selftest: coordinates concurrent runs",
+    "selftest: no mutated source committed",
 }
 
 
@@ -2699,7 +2700,8 @@ MUTATIONS = [
         "file": "review.py",
         "old": "    degraded = render.compress_degraded(degraded)\n",
         "new": "",
-        "checks": ["review: degradation residue compresses"],
+        "checks": ["review: degradation residue compresses",
+                   "selftest: no mutated source committed"],
     },
     {
         "name": "MCP argument type enforcement removed",
@@ -2713,7 +2715,8 @@ MUTATIONS = [
         "file": "mcp_server.py",
         "old": "json.loads(line, object_pairs_hook=_no_duplicate_keys)",
         "new": "json.loads(line)",
-        "checks": ["mcp: tool arguments are typed"],
+        "checks": ["mcp: tool arguments are typed",
+                   "selftest: no mutated source committed"],
     },
     {
         "name": "MCP error shape broken (bare string from _err)",
@@ -2844,7 +2847,8 @@ MUTATIONS = [
         "old": "            if os.path.exists(_sentinel_path(kind)):\n                return kind\n",
         "new": "            if os.path.exists(_sentinel_path(kind)):\n                pass\n",
         "checks": ["dashboard: watcher stops cleanly",
-                   "dashboard: --pause freezes a final page"],
+                   "dashboard: --pause freezes a final page",
+                   "selftest: no mutated source committed"],
     },
     {
         "name": "watcher pause final render removed",
@@ -2865,6 +2869,44 @@ MUTATIONS = [
         "checks": ["mcp: dashboard_status tool"],
     },
 ]
+
+
+def t_no_mutation_residue_in_sources():
+    """No registered broken form may sit in the tracked sources.
+
+    A --mutate run rewrites sources and restores them in a finally, so the
+    only way a broken form survives is a killed run whose journal was also
+    lost, or a commit that raced a restore - commit 0ebb4be captured exactly
+    that, and HEAD carried a broken stop wake for an hour. The mutator's own
+    heal restores from the journal, but no journal means no heal, so the
+    suite itself must notice. For each registry entry the correct form must
+    appear exactly once (an absent anchor means the mutation is applied or
+    the anchor rotted; either way the guard it pins is unverifiable), and a
+    broken form that is distinguishable - non-empty, and not a substring of
+    the correct form it replaces - must be absent. Deletions and trimmed
+    tails are covered by the anchor alone, since their broken shape is
+    either everywhere (empty string) or legitimate code (the tail).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    srcs = {}
+    for mut in MUTATIONS:
+        rel, old, new = mut["file"], mut["old"], mut["new"]
+        if rel not in srcs:
+            with open(os.path.join(here, rel), encoding="utf-8", newline="") as fh:
+                srcs[rel] = fh.read()
+        src = srcs[rel]
+        n = src.count(old)
+        assert n == 1, (
+            "%s: the correct form appears %d times in %s, expected exactly 1 "
+            "- the mutation is applied or the anchor rotted" % (mut["name"], n, rel))
+        if not new or new in old:
+            continue  # not distinguishable; the exact-once anchor is the guard
+        hits = src.count(new)
+        assert hits == 0, (
+            "%s: the broken form is present in %s (%d hits) - the tree holds "
+            "mutated source; restore from git or re-run the suite to heal"
+            % (mut["name"], rel, hits))
+    return "all %d anchors exact; no distinguishable broken form present" % len(MUTATIONS)
 
 
 def _run_mutations():
@@ -3176,6 +3218,7 @@ def _build_checks(live):
         ("dashboard: --pause freezes a final page", t_dashboard_pause_freezes_a_final_page),
         ("mcp: dashboard_status tool", t_mcp_dashboard_status_tool),
         ("doc counts match the roster", t_doc_counts_match_roster),
+        ("selftest: no mutated source committed", t_no_mutation_residue_in_sources),
         ("selftest: coordinates concurrent runs", t_selftest_coordinates_concurrent_runs),
     ]
     if live:

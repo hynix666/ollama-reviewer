@@ -42,8 +42,8 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 73 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 69 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 74 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 70 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
 python scripts/selftest.py --mutate   # proves each regression guard has teeth
 ```
