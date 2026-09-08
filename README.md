@@ -37,7 +37,7 @@ Then verify:
 python ~/.claude/skills/ollama-reviewer/scripts/selftest.py
 ```
 
-65 checks should pass (61 without a running Ollama server). Add `--live` to also run real inference against a file with
+73 checks should pass (69 without a running Ollama server). Add `--live` to also run real inference against a file with
 deliberately planted defects, or `--offline` to skip the three checks that need a
 running Ollama server — that is what CI runs, across Python 3.9–3.13 on Linux,
 Windows and macOS (Python 3.8, the supported floor, runs byte-compilation only).
@@ -152,9 +152,14 @@ calls to shelling out. Register it in `~/.claude.json`:
 }
 ```
 
-Restart the client, and four tools appear: `ollama_review_file`,
-`ollama_review_code`, `ollama_review_diff`, and `ollama_list_models`. Each
-accepts `focus`, `adversarial`, `instructions`, `models` and `format`.
+Restart the client, and five tools appear: `ollama_review_file`,
+`ollama_review_code`, `ollama_review_diff`, `ollama_list_models`, and
+`dashboard_status` (a read-only report of the dashboard watcher's lock state, any
+pending shutdown request - a stop/pause sentinel outliving a dead watcher would be
+honored by the next watcher - and the selftest mutation marker: in flight,
+stranded, or none).
+The three review tools accept `focus`, `adversarial`, `instructions`,
+`models` and `format`.
 
 It speaks JSON-RPC 2.0 over stdio with no SDK dependency — the protocol surface
 needed is small enough that adding a PyPI package to get it would cost more than
@@ -163,6 +168,26 @@ stderr, since a stray print corrupts the stream and disconnects the client.
 
 The CLI remains the primary interface: it works without a client restart and is
 debuggable from a terminal.
+
+## Dashboard watcher
+
+`python scripts/dashboard.py --watch` regenerates `.freebuff/preview/dashboard.html`
+every `--interval` seconds (default 120) under a pidfile lock; an edit to any
+watched source (`scripts/*.py`, `config.json`) regenerates immediately. Two ways
+to bring it down, both at safe points only — in-flight selftest and mutate runs
+finish first, so neither leaves a marker, journal, or half-rewritten source:
+
+```bash
+python scripts/dashboard.py --stop    # shut down; the page stays as it is
+python scripts/dashboard.py --pause   # render one final fresh page, then shut down
+```
+
+Prefer `--pause` when the artifact should keep existing but stop updating: it
+freezes the page at a current state (the footer is marked `pause requested` and
+auto-refresh is dropped), so nothing stale is left behind. Prefer `--stop` when
+the page will be regenerated soon anyway or you just want the process gone.
+Both wait for the watcher to exit (`--stop-timeout`, default 900s), exit 0 on a
+clean shutdown, and exit 1 if the watcher is still running past the timeout.
 
 ## Multi-model consensus
 

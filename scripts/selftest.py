@@ -7,6 +7,8 @@ Exits non-zero if any check fails.
 """
 
 import argparse
+import atexit
+import base64
 import contextlib
 import io
 import json
@@ -17,9 +19,168 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mutation_marker  # noqa: E402  stdlib-only, never a mutation target: safe pre-gate
+
+# ---------------------------------------------------------------------------
+# Concurrent-run discipline: a --mutate run temporarily rewrites module
+# sources on disk, and every suite creates temp dirs. Two mechanisms keep a
+# watcher cycle from flipping an unrelated run red:
+#   1. A marker file in the OS temp dir while --mutate is in flight. A run
+#      started during it waits for quiescence BEFORE importing project
+#      modules, and disk-reading checks skip rather than lie. The mutator's
+#      own children carry _MUTATOR_ENV and ignore the marker, so mutation
+#      verification stays strict. A crashed mutator's marker is recovered
+#      like the dashboard pidfile lock: the holder pid is checked, and a
+#      dead holder clears at once - a killed session never gates the next
+#      suite - while only unparseable content waits out the 950s age
+#      backstop (no mutate run lives past its 900s child timeouts). A hard
+#      kill can also land mid-rewrite, leaving a mutation applied; the run
+#      journals each module's original bytes first, and the next suite
+#      restores them from that journal before importing anything.
+#   2. The residue check re-checks survivors across a short grace window,
+#      because an in-flight dir from any concurrent suite clears in seconds.
+
+_MUTATOR_ENV = "_SELFTEST_MUTATOR"
+# _SELFTEST_MUTATION_MARKER: test seam (same trust level as _MUTATOR_ENV) -
+# lets the coordination check point a spawned child at a privately held
+# marker so the ambient one can never deadlock the grandchild. The default
+# path has one home: mutation_marker.path().
+_MUTATION_MARKER = os.environ.get("_SELFTEST_MUTATION_MARKER") or mutation_marker.path()
+
+
+def _clear_mutation_marker():
+    try:
+        os.remove(_MUTATION_MARKER)
+    except OSError:
+        pass
+
+
+def _mutation_in_flight():
+    """True while another process's --mutate run holds the marker.
+
+    Recovery mirrors the dashboard pidfile lock: a marker whose holder pid
+    has died clears at once, so a killed session never gates the next
+    suite. Only unparseable content falls back to the age backstop, which
+    bounds even that."""
+    if _MUTATOR_ENV in os.environ:  # the mutator's own children are sanctioned
+        return False
+    try:
+        with open(_MUTATION_MARKER, "r", encoding="utf-8", errors="replace") as fh:
+            holder = fh.read().strip()
+        age = time.time() - os.path.getmtime(_MUTATION_MARKER)
+    except OSError:
+        return False  # absent
+    if age > mutation_marker.AGE_BACKSTOP_S:
+        _clear_mutation_marker()  # stale: self-expires, never wedges
+        return False
+    import pidutil  # safe mid-mutation: stdlib-only, never a mutation target
+    if holder.isdigit() and not pidutil.pid_alive(int(holder)):
+        sys.stderr.write("selftest: mutation marker holder pid %s is dead; "
+                         "clearing the marker\n" % holder)
+        _clear_mutation_marker()
+        return False
+    return True  # live holder, or unparseable content: age guard bounds it
+
+
+def _clear_pycache():
+    """Drop compiled caches under scripts/ so the next import sees source.
+
+    mtime+size pyc validation can miss a same-size mutation-restore cycle
+    that lands within one mtime second. Defined early: the quiescence gate
+    and the journal heal both run at import time, before the rest of the
+    module exists."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cache = os.path.join(here, "__pycache__")
+    if os.path.isdir(cache):
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def _journal_path():
+    """The write-side journal pairs with the marker: marker path + suffix,
+    so seam-swapped tests move both together."""
+    return _MUTATION_MARKER + ".journal"
+
+
+def _clear_mutation_journal():
+    try:
+        os.remove(_journal_path())
+    except OSError:
+        pass
+
+
+def _write_mutation_journal(name, rel, original_bytes):
+    """Record the pre-rewrite bytes of a module under mutation.
+
+    Written before the rewrite and cleared after the restore, so a journal
+    that outlives the run means a mutation may still be applied. Atomic
+    replace: a kill mid-write leaves the previous (already-restored) entry,
+    never a torn one."""
+    entry = {"name": name, "file": rel,
+             "content_b64": base64.b64encode(original_bytes).decode("ascii")}
+    tmp = _journal_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(entry, fh)
+    os.replace(tmp, _journal_path())
+
+
+def _heal_mutation_journal():
+    """Restore sources if a dead --mutate run left a mutation applied.
+
+    Called only when no live mutate holds the marker: the journal then
+    cannot belong to a working run, so writing the journaled bytes back is
+    always safe - a no-op when the file was already restored. Refuses for
+    the mutator's own children: they run mid-journal by design, so that
+    guard lives here rather than at the call site."""
+    if _MUTATOR_ENV in os.environ:  # the mutator's own children never heal
+        return
+    try:
+        with open(_journal_path(), "r", encoding="utf-8") as fh:
+            entry = json.load(fh)
+        original = base64.b64decode(entry["content_b64"])
+        name, rel = entry["name"], entry["file"]
+    except (OSError, ValueError, KeyError):
+        return  # absent or unreadable: nothing safe to do automatically
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+    try:
+        with open(path, "rb") as fh:
+            current = fh.read()
+    except OSError:
+        return  # target gone since: the journal is stale beyond repair
+    if current == original:
+        _clear_mutation_journal()  # restored already; just drop the stale entry
+        return
+    with open(path, "wb") as fh:
+        fh.write(original)
+    _clear_pycache()
+    _clear_mutation_journal()
+    sys.stderr.write("selftest: restored %s, left mutated by a dead --mutate "
+                     "run (%s)\n" % (rel, name))
+
+
+def _wait_for_quiescence():
+    """Block until a concurrent --mutate run releases the source files.
+
+    Importing a module mid-mutation runs mutated code, so every check would
+    be untrustworthy; waiting is slow but honest. A dead holder's marker
+    clears at once (holder liveness via pidutil) and the age guard bounds
+    the rest, so the wait always terminates. A journal left by a run that
+    died mid-rewrite is healed here too, before anything imports."""
+    if _mutation_in_flight():
+        sys.stderr.write("selftest: concurrent --mutate in flight; waiting for it "
+                         "to finish before importing modules\n")
+        deadline = time.time() + 960
+        while _mutation_in_flight() and time.time() < deadline:
+            time.sleep(5)
+        if _mutation_in_flight():  # unreachable in practice (age guard)
+            _clear_mutation_marker()
+    _heal_mutation_journal()  # refuses for the mutator's own children itself
+
+
+_wait_for_quiescence()
 
 import cli  # noqa: E402
 import config  # noqa: E402
@@ -57,6 +218,15 @@ NEEDS_SERVER = {
     "default model resolves",
     "bare family name resolves",
     "live review of planted defects",
+}
+
+# Checks that re-read module sources from disk: unreliable while a concurrent
+# --mutate run has them rewritten, so they skip honestly instead of failing.
+# (The residue check needs no exemption: it judges only dirs this run owns.)
+MUTATION_SENSITIVE = {
+    "orchestration + focus decoupled",
+    "dashboard: watcher pidfile lock",
+    "selftest: coordinates concurrent runs",
 }
 
 
@@ -366,6 +536,12 @@ def _fake_host(base_url):
             os.environ["OLLAMA_HOST"] = saved
 
 
+# Every temp dir this process's fixtures ever created, in creation order.
+# t_tempdir_leaves_no_residue asserts these are all gone - ownership, not
+# snapshot timing, so a concurrent suite's churn cannot flip the verdict.
+_OUR_TMPDIRS = []
+
+
 @contextlib.contextmanager
 def _tmpdir():
     """Yield a temp directory that is removed afterwards.
@@ -374,6 +550,7 @@ def _tmpdir():
     read-only and the first rmtree cannot remove them.
     """
     tmp = tempfile.mkdtemp()
+    _OUR_TMPDIRS.append(tmp)
     try:
         yield tmp
     finally:
@@ -411,13 +588,7 @@ def _repo(commits=1, files=()):
         yield tmp
 
 
-def _temp_entries():
-    """Names of the current entries in the OS temp dir."""
-    return set(os.listdir(tempfile.gettempdir()))
 
-# Temp-dir state before any fixture runs; t_tempdir_leaves_no_residue
-# (registry-last) compares against it.
-_TEMP_SNAPSHOT = _temp_entries()
 
 
 def t_tempdir_leaves_no_residue():
@@ -425,20 +596,18 @@ def t_tempdir_leaves_no_residue():
 
     Windows regression lock: git writes its loose object files read-only,
     so a naive shutil.rmtree cannot remove a fixture repo (WinError 5).
-    _tmpdir has a second pass that chmods and re-removes; this check
-    snapshots the OS temp dir at import and fails if any new tmp-prefixed
-    directory survives the suite, empty shell or not (the Windows
-    residue is a populated repo with read-only objects). Concurrent
-    processes' temp churn could in principle trip it; CI is hermetic
-    and a re-run tells them apart instantly.
+    _tmpdir has a second pass that chmods and re-removes; this check fails
+    if any directory this suite's fixtures created still exists - empty
+    shell or not (the Windows residue is a populated repo with read-only
+    objects).
+
+    Ownership, not snapshots: only dirs _this_ run created are judged, so
+    a concurrently running suite's in-flight dirs can never flip the
+    verdict, and no grace-window timing heuristic is needed.
     """
-    base = tempfile.gettempdir()
-    survivors = sorted(
-        d for d in _temp_entries() - _TEMP_SNAPSHOT
-        if d.startswith("tmp")
-        and os.path.isdir(os.path.join(base, d)))
-    assert not survivors, """fixture residue survived cleanup: %s""" % survivors
-    return """temp dir clean: no fixture residue survived"""
+    leaked = sorted(d for d in _OUR_TMPDIRS if os.path.isdir(d))
+    assert not leaked, "fixture residue survived cleanup: %s" % leaked
+    return "temp dir clean: all %d fixture dirs removed" % len(_OUR_TMPDIRS)
 
 def t_modules_stay_focused():
     """CONTRIBUTING promises modules stay near 400 lines; enforce it.
@@ -458,6 +627,383 @@ def t_modules_stay_focused():
             oversized.append("%s (%d)" % (name, n))
     assert not oversized, "over %d lines: %s" % (limit, ", ".join(oversized))
     return "all tool modules within %d lines" % limit
+
+
+def t_dashboard_lock_is_exclusive():
+    """The watcher pidfile lock: claims, refuses rivals, recovers stale files."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dashboard
+    with _tmpdir() as tmp:
+        lock = os.path.join(tmp, "watch.pid")
+
+        ok, holder = dashboard._claim(lock)
+        assert ok and holder is None, "first claim on an empty dir must acquire"
+        assert int(open(lock).read().strip()) == os.getpid(), "pidfile must hold our pid"
+
+        ok, holder = dashboard._claim(lock)
+        assert not ok and holder == os.getpid(), "second claim must refuse while holder lives"
+        assert int(open(lock).read().strip()) == os.getpid(), "refusal must not clobber the file"
+
+        with open(lock, "w") as fh:  # fake a long-dead holder: pid far above pid_max
+            fh.write(str(1 << 30))
+        ok, holder = dashboard._claim(lock)
+        assert ok and holder is None, "claim over a dead holder's pidfile must recover"
+
+        with open(lock, "w") as fh:  # corrupted pidfile: unreadable pid
+            fh.write("garbage")
+        ok, holder = dashboard._claim(lock)
+        assert ok and holder is None, "claim over a corrupt pidfile must recover"
+
+        os.remove(lock)
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "dashboard.py"), encoding="utf-8").read()
+    assert "_claim(PID_PATH)" in src, "watch() must still acquire the pidfile lock"
+
+    # Process-level end to end, the stdio-E2E doctrine applied to the watcher:
+    # spawn a real rival against a scratch pidfile and pin that the lock holds
+    # at the process boundary too - the second process exits 1, explains why,
+    # and writes nothing. Scratch artifacts live under .freebuff/preview/ (not
+    # the OS temp dir) so the residue check sees nothing; DASHBOARD_PIDFILE
+    # keeps the production watcher's pidfile out of reach.
+    scratch = os.path.join(here, os.pardir, ".freebuff", "preview")
+    os.makedirs(scratch, exist_ok=True)
+    base = os.path.join(scratch, "_lock_e2e_%d" % os.getpid())
+    pidfile, r_out, r_err = base + ".pid", base + ".out", base + ".err"
+    try:
+        with open(pidfile, "w") as fh:  # pretend a watcher is already running
+            fh.write(str(os.getpid()))
+        env = dict(os.environ, DASHBOARD_PIDFILE=pidfile)
+        rival = subprocess.run(
+            [sys.executable, os.path.join(here, "dashboard.py"), "--watch",
+             "--interval", "3600", base + ".html"],
+            capture_output=True, text=True, timeout=60, cwd=here, env=env)
+        assert rival.returncode == 1, (rival.returncode, rival.stderr[-300:])
+        assert "refusing to start" in rival.stderr, rival.stderr[-300:]
+        assert "already running" in rival.stderr, rival.stderr[-300:]
+        assert not os.path.exists(base + ".html"), "rival must not write the artifact"
+        assert int(open(pidfile).read().strip()) == os.getpid(), (
+            "rival must not clobber the pidfile")
+    finally:
+        for p in (pidfile, r_out, r_err, base + ".html"):
+            if os.path.exists(p):
+                os.remove(p)
+    return "claim, refuse, stale/corrupt recovery, and process-level refusal all behave"
+
+
+def t_dashboard_watch_reacts_to_disk():
+    """The watcher wakes on a watched-source edit instead of sleeping out
+    the interval: content-hash fingerprinting over scripts/*.py plus
+    config.json, an interruptible wait, and watch() wired to both."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import config
+    import dashboard
+    import dashpage
+    with _tmpdir() as tmp:
+        scripts = os.path.join(tmp, "scripts")
+        os.makedirs(scripts)
+        a = os.path.join(scripts, "a.py")
+        b = os.path.join(scripts, "b.py")
+        cfg = os.path.join(tmp, "config.json")
+        for path, body in ((a, "x = 1\n"), (b, "y = 2\n"), (cfg, "{}")):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        saved_root, saved_cfg = dashboard.ROOT, config.CONFIG_PATH
+        dashboard.ROOT, config.CONFIG_PATH = tmp, cfg  # steer at the seams
+        try:
+            fp = dashboard.watched_fingerprint()
+            assert sorted(os.path.normpath(k) for k in fp) == \
+                sorted(os.path.normpath(k) for k in (a, b, cfg)), (
+                    "fingerprint must cover the watched set exactly: %s" % sorted(fp))
+
+            with open(a, "w", encoding="utf-8") as fh:  # a real edit registers
+                fh.write("x = 2\n")
+            fp_edit = dashboard.watched_fingerprint()
+            assert fp_edit != fp, "an edit must change the fingerprint"
+
+            body = open(a, encoding="utf-8").read()
+            with open(a, "w", encoding="utf-8") as fh:  # same bytes, new mtime
+                fh.write(body)
+            assert dashboard.watched_fingerprint() == fp_edit, (
+                "a restore-after-rewrite (mutation registry's signature move) "
+                "must not register")
+
+            os.remove(b)  # deletion and creation register too
+            assert b not in dashboard.watched_fingerprint()
+            c = os.path.join(scripts, "c.py")
+            with open(c, "w", encoding="utf-8") as fh:
+                fh.write("z = 3\n")
+            assert os.path.normpath(c) in (
+                os.path.normpath(k) for k in dashboard.watched_fingerprint())
+
+            # The wake: a rewrite from another thread ends the wait far early.
+            def touch():
+                time.sleep(0.25)
+                with open(a, "w", encoding="utf-8") as fh:
+                    fh.write("x = 3\n")
+            fp_wait = dashboard.watched_fingerprint()
+            th = threading.Thread(target=touch)
+            th.start()
+            started = time.time()
+            woke = dashboard._wait_for_change(fp_wait, 5.0)
+            took = time.time() - started
+            th.join()
+            assert woke == "edit", "a watched edit must end the wait early: %r" % woke
+            assert took < 3.0, "wait should have been cut short, took %.1fs" % took
+
+            assert dashboard._wait_for_change(
+                dashboard.watched_fingerprint(), 0.3) == "", (
+                "an unchanged tree must sleep out the full budget")
+        finally:
+            dashboard.ROOT, config.CONFIG_PATH = saved_root, saved_cfg
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.py"), encoding="utf-8").read()
+    assert "snapshot = watched_fingerprint()" in src, (
+        "watch() must fingerprint the sources before gathering")
+    assert "_wait_for_change(snapshot" in src, (
+        "watch() must wait interruptibly on that snapshot")
+    for reason in ("startup", "interval tick", "watched source edit",
+                   "pause requested"):
+        assert reason in src, "the generation reason %r must exist" % reason
+    assert '"generation"' in src, "watch() must record why each cycle ran"
+
+    page = {"rows": [], "mods": [], "up": True, "n_models": 0, "live": False,
+            "mut_ok": True, "mut_total": 21, "ci": [], "ci_note": None,
+            "commits": [], "tree": "clean",
+            "marker": {"state": "absent", "holder": None,
+                       "holder_alive": None, "age_s": None}}
+    assert "cycle" not in dashpage.render(page).split("<footer>")[1], (
+        "a one-shot page must not claim a cycle")
+    page["generation"] = (14, "watched source edit")
+    footer = dashpage.render(page).split("<footer>")[1]
+    assert "cycle 14, watched source edit" in footer, footer[:200]
+    return "an edit wakes the watcher, a restore does not, reasons reach the footer"
+
+
+def t_dashboard_degraded_cycles_explain_themselves():
+    """A child without a verdict must say so on the page.
+
+    gather attaches a bounded note (exit code, stream tails) to any child
+    whose summary went missing - a crash or a kill - and the page renders
+    it as a warning with a NO VERDICT chip instead of a bare zero that
+    reads like a regression that never happened."""
+    import dashboard
+    import dashpage
+    note = dashboard._degradation_note("the offline selftest", 1,
+                                       "partial output", "boom traceback")
+    assert "exit=1" in note and "boom traceback" in note, note
+    assert len(dashboard._degradation_note("m", 2, "", "x" * 5000)) < 800, (
+        "notes must be bounded")
+
+    marker = {"state": "absent", "holder": None, "holder_alive": None,
+              "age_s": None}
+    page = {"rows": [], "mods": [], "up": True, "n_models": 0, "live": False,
+            "mut_ok": True, "mut_total": 21, "ci": [], "ci_note": None,
+            "commits": [], "tree": "clean", "marker": marker,
+            "rows_note": None, "mut_note": None}
+    assert "&#9888;" not in dashpage.render(page), "a healthy page must not warn"
+
+    page["rows_note"] = note
+    html = dashpage.render(page)
+    assert "&#9888;" in html and "boom traceback" in html and "exit=1" in html, (
+        html[-400:])
+
+    page["rows_note"], page["mut_note"] = None, dashboard._degradation_note(
+        "the mutation registry run", 3, "", "baseline assert blew up")
+    page["mut_ok"] = False  # no verdict is not a regression verdict
+    html = dashpage.render(page)
+    assert "NO VERDICT" in html and "baseline assert blew up" in html, html[-400:]
+    assert "REGRESSION" not in html, "a no-verdict cycle must not claim regression"
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.py"), encoding="utf-8").read()
+    assert '"rows_note"' in src and '"mut_note"' in src, (
+        "gather must carry the degradation notes to the page")
+    return "degraded cycles render exit codes and stderr tails as page warnings"
+
+
+def t_dashboard_watcher_stops_cleanly():
+    """--stop asks the watcher to exit at a safe point and waits for it.
+
+    The sentinel beside the pidfile wakes the interruptible wait; the loop
+    only exits between gathers, so selftest and mutate children always
+    finish - no half-rewrite, marker, or journal survives a stop. A fresh
+    watcher clears a stale sentinel instead of dying on it."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import threading
+    import dashboard
+    saved = os.environ.get("DASHBOARD_PIDFILE")
+    try:
+        with _tmpdir() as tmp:
+            pf = os.path.join(tmp, "watch.pid")
+            os.environ["DASHBOARD_PIDFILE"] = pf  # the stop seams read it per call
+
+            assert not dashboard._consume_request("stop"), (
+                "no sentinel: consume must report nothing")
+            with open(pf + ".stop", "w") as fh:
+                fh.write("stop\n")
+            assert dashboard._consume_request("stop"), "a sentinel must consume"
+            assert not os.path.exists(pf + ".stop"), "consume must remove it"
+
+            # the interruptible wait wakes on stop, before its budget runs out
+            snapshot = dashboard.watched_fingerprint()
+
+            def request_stop():
+                time.sleep(0.2)
+                with open(pf + ".stop", "w") as fh:
+                    fh.write("stop\n")
+            th = threading.Thread(target=request_stop)
+            th.start()
+            started = time.time()
+            waited = dashboard._wait_for_change(snapshot, 30.0)
+            took = time.time() - started
+            th.join()
+            assert waited == "stop", "a stop request must cut the wait: %r" % waited
+            assert took < 10.0, "stop must wake the wait, took %.1fs" % took
+
+            # not running: both stale-pidfile shapes exit 0 and clean up
+            with open(pf + ".stop", "w") as fh:
+                fh.write("stop\n")
+            with open(pf, "w") as fh:
+                fh.write(str(1 << 30))
+            assert dashboard.shutdown_watcher("stop", timeout=5) == 0, (
+                "a dead holder is 'not running'")
+            assert not os.path.exists(pf + ".stop"), (
+                "a stale request must be cleared, never inherited")
+
+            # timeout: a live holder that ignores the request reports and keeps it
+            with open(pf + ".stop", "w") as fh:
+                fh.write("stop\n")
+            with open(pf, "w") as fh:
+                fh.write(str(os.getpid()))
+            assert dashboard.shutdown_watcher("stop", timeout=2) == 1, (
+                "a live holder past the timeout must report failure")
+            assert os.path.exists(pf + ".stop"), (
+                "a pending request must survive a timed-out stop")
+            os.remove(pf + ".stop")
+
+            # success: the holder exits, releasing the pidfile like the real
+            # watcher's finally does; the command reports a clean stop
+            child = subprocess.Popen([sys.executable, "-c",
+                                      "import os, time, sys; time.sleep(0.5); "
+                                      "os.remove(sys.argv[1])", pf])
+            with open(pf, "w") as fh:
+                fh.write(str(child.pid))
+            assert dashboard.shutdown_watcher("stop", timeout=30) == 0, (
+                "a holder that exits must stop cleanly")
+            assert not os.path.exists(pf + ".stop"), (
+                "a completed stop must leave no sentinel")
+    finally:
+        if saved is None:
+            os.environ.pop("DASHBOARD_PIDFILE", None)
+        else:
+            os.environ["DASHBOARD_PIDFILE"] = saved
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.py"), encoding="utf-8").read()
+    assert 'if _consume_request("stop"):' in src, (
+        "the watch loop must check for stop at the safe point")
+    assert 'for kind in ("stop", "pause"):  # a fresh watcher' in src, (
+        "a fresh watcher must clear stale requests of both kinds")
+    return "stop sentinel wakes the wait, times out loudly, and cleans up"
+
+
+def t_dashboard_pause_freezes_a_final_page():
+    """--pause exits at the next safe point but freezes a fresh page first.
+
+    --stop leaves the page as it stands; --pause renders one final page
+    (reason "pause requested", auto-refresh dropped) so the artifact stops
+    updating from an accurate snapshot instead of a stale one."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import threading
+    import dashboard
+    saved = os.environ.get("DASHBOARD_PIDFILE")
+    try:
+        with _tmpdir() as tmp:
+            pf = os.path.join(tmp, "watch.pid")
+            os.environ["DASHBOARD_PIDFILE"] = pf  # the pause seams read it per call
+
+            # the interruptible wait wakes on pause, before its budget runs out
+            def request_pause():
+                time.sleep(0.2)
+                with open(pf + ".pause", "w") as fh:
+                    fh.write("pause\n")
+            th = threading.Thread(target=request_pause)
+            th.start()
+            started = time.time()
+            waited = dashboard._wait_for_change(
+                dashboard.watched_fingerprint(), 30.0)
+            took = time.time() - started
+            th.join()
+            assert waited == "pause", "a pause request must cut the wait: %r" % waited
+            assert took < 10.0, "pause must wake the wait, took %.1fs" % took
+
+            # client side: a stale request is cleared, a live holder is waited out
+            with open(pf, "w") as fh:
+                fh.write(str(1 << 30))
+            with open(pf + ".pause", "w") as fh:
+                fh.write("pause\n")
+            assert dashboard.shutdown_watcher("pause", timeout=5) == 0, (
+                "a dead holder is 'not running'")
+            assert not os.path.exists(pf + ".pause"), (
+                "a stale pause request must be cleared, never inherited")
+
+            child = subprocess.Popen([sys.executable, "-c",
+                                      "import os, time, sys; time.sleep(0.5); "
+                                      "os.remove(sys.argv[1])", pf])
+            with open(pf, "w") as fh:
+                fh.write(str(child.pid))
+            assert dashboard.shutdown_watcher("pause", timeout=30) == 0, (
+                "a holder that exits must pause cleanly")
+            assert not os.path.exists(pf + ".pause"), (
+                "a completed pause must leave no sentinel")
+
+            # the state machine: pause at a safe point renders exactly one
+            # final page; stop wins when both requests are pending
+            class Args:
+                interval = 120.0
+                output = os.path.join(tmp, "out.html")
+            calls = []
+            orig = dashboard._cycle, dashboard._wait_for_change
+            dashboard._cycle = (
+                lambda n, reason, args: calls.append((n, reason)) or ({}, 0.0))
+
+            def fake_wait(snapshot, budget, **kw):
+                with open(pf + ".pause", "w") as fh:  # the wait reports only
+                    fh.write("pause\n")               # requests that are on disk
+                return "pause"
+            dashboard._wait_for_change = fake_wait
+            try:
+                dashboard.watch(Args())
+                assert calls == [(1, "startup"), (2, "pause requested")], calls
+                calls.clear()
+                with open(pf + ".pause", "w") as fh:  # paused before any cycle
+                    fh.write("pause\n")
+                dashboard.watch(Args())
+                assert calls == [(1, "pause requested")], calls
+                calls.clear()
+                with open(pf + ".pause", "w") as fh:
+                    fh.write("pause\n")
+                with open(pf + ".stop", "w") as fh:  # stop wins over pause
+                    fh.write("stop\n")
+                dashboard.watch(Args())
+                assert calls == [], "stop must win over a pending pause: %r" % calls
+                os.remove(pf + ".pause")
+            finally:
+                dashboard._cycle, dashboard._wait_for_change = orig
+    finally:
+        if saved is None:
+            os.environ.pop("DASHBOARD_PIDFILE", None)
+        else:
+            os.environ["DASHBOARD_PIDFILE"] = saved
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "dashboard.py"), encoding="utf-8").read()
+    assert '_cycle(n + 1, "pause requested", args)' in src, (
+        "the pause safe point must render one final page")
+    assert 'refresh = 0 if reason == "pause requested"' in src, (
+        "a frozen page must not claim to auto-refresh")
+    return "--pause wakes the wait, freezes one final page, and cleans up"
 
 
 def t_review_options_decoupled():
@@ -721,6 +1267,147 @@ def t_mcp_dispatch_all_tools_on_fake():
         srv.close()
 
 
+def t_mcp_dashboard_status_tool():
+    """The dashboard_status MCP tool: dispatch, all four watcher states, shapes,
+    pending shutdown requests, and every mutation-marker state through the
+    same call_tool path - with the page chip rendered from the same states."""
+    import dashboard
+    import dashpage
+
+    saved = os.environ.get("DASHBOARD_PIDFILE")
+    try:
+        with _tmpdir() as tmp:
+            pf = os.path.join(tmp, "watch.pid")
+            os.environ["DASHBOARD_PIDFILE"] = pf  # watcher_status reads it per call
+
+            # no pidfile -> not running
+            st = dashboard.watcher_status()
+            assert st == {"running": False, "pid": None, "stale": False,
+                          "pidfile": pf, "pending": []}, st
+            out = mcp_server.call_tool("dashboard_status", {})
+            assert out["isError"] is False, out
+            assert "not running" in out["content"][0]["text"], out["content"][0]["text"]
+
+            # dead holder -> stale, reported honestly, never as "running"
+            with open(pf, "w") as fh:
+                fh.write(str(1 << 30))
+            st = dashboard.watcher_status()
+            assert st["running"] is False and st["stale"] is True, st
+            assert st["pid"] == 1 << 30, st
+            t = mcp_server.call_tool("dashboard_status", {})["content"][0]["text"]
+            assert "stale" in t and "not running" in t, t
+
+            # live holder -> running (this very process holds the "lock")
+            with open(pf, "w") as fh:
+                fh.write(str(os.getpid()))
+            st = dashboard.watcher_status()
+            assert st["running"] is True and st["pid"] == os.getpid(), st
+            assert not st["stale"], st
+            t = mcp_server.call_tool("dashboard_status", {})["content"][0]["text"]
+            assert "running (pid %d)" % os.getpid() in t, t
+
+            # corrupt pidfile -> same shape as missing, never an exception
+            with open(pf, "w") as fh:
+                fh.write("garbage")
+            st = dashboard.watcher_status()
+            assert st == {"running": False, "pid": None, "stale": False,
+                          "pidfile": pf, "pending": []}, st
+
+            # pending shutdown requests through the same body: the sentinel
+            # paths ride the pidfile seam, so private files drive every state
+            t = dashboard.watcher_status_text()
+            assert "shutdown requests: none" in t, t
+            for kind, line in (("stop", "shutdown requests: stop (watcher "
+                                "exits at its next safe point)"),
+                               ("pause", "shutdown requests: pause (one final "
+                                "page renders, then exit)")):
+                with open(pf + "." + kind, "w") as fh:
+                    fh.write(kind + "\n")
+                assert line in dashboard.watcher_status_text()
+                os.remove(pf + "." + kind)
+            with open(pf + ".stop", "w") as fh:  # both pending: stop wins
+                fh.write("stop\n")
+            with open(pf + ".pause", "w") as fh:
+                fh.write("pause\n")
+            t = dashboard.watcher_status_text()
+            assert ("shutdown requests: stop+pause (both pending - stop wins)"
+                    in t), t
+            with open(pf, "w") as fh:  # the dangerous case: a request
+                fh.write(str(1 << 30))  # outliving a dead watcher
+            t = dashboard.watcher_status_text()
+            assert ("shutdown requests: stop+pause" in t
+                    and "not running" in t and "stale" in t), t
+            os.remove(pf + ".stop")
+            os.remove(pf + ".pause")
+
+            # mutation-marker states through the same tool body: the marker
+            # path is a per-call seam, so a private marker drives every state
+            # without touching the ambient one (a real mutate may be running)
+            saved_marker = os.environ.get("_SELFTEST_MUTATION_MARKER")
+            os.environ["_SELFTEST_MUTATION_MARKER"] = mk = os.path.join(tmp, "mut.mark")
+
+            def page_with_marker():
+                """The page, rendered from a minimal gather with the marker
+                state read live off the private seam."""
+                page = {"rows": [], "mods": [], "up": True, "n_models": 0,
+                        "live": False, "mut_ok": True, "mut_total": 20,
+                        "ci": [], "ci_note": None, "commits": [], "tree": "clean"}
+                page["marker"] = mutation_marker.status()
+                return dashpage.render(page)
+
+            try:
+                assert "mutation marker: none" in dashboard.watcher_status_text()
+                assert 'mutation marker: <b>none</b>' in page_with_marker()
+                with open(mk, "w") as fh:  # live holder: this process
+                    fh.write(str(os.getpid()))
+                t = dashboard.watcher_status_text()
+                assert ("mutation marker: in flight (holder pid %d alive"
+                        % os.getpid()) in t, t
+                assert ('mutation marker: <b>in flight</b> (pid %d,'
+                        % os.getpid()) in page_with_marker(), t
+                with open(mk, "w") as fh:  # a killed session's leftover
+                    fh.write(str(1 << 30))
+                t = dashboard.watcher_status_text()
+                assert ("mutation marker: STRANDED (holder pid %d is dead"
+                        % (1 << 30)) in t, t
+                assert ('mutation marker: <b>STRANDED</b> (pid %d dead'
+                        % (1 << 30)) in page_with_marker(), t
+                with open(mk, "w") as fh:  # unparseable: gates until the backstop
+                    fh.write("garbage")
+                t = dashboard.watcher_status_text()
+                assert "mutation marker: in flight (unparseable holder" in t, t
+                assert ('mutation marker: <b>in flight</b> (unparseable holder'
+                        ) in page_with_marker(), t
+                backstop = mutation_marker.AGE_BACKSTOP_S
+                with open(mk, "w") as fh:  # live holder, but past the backstop
+                    fh.write(str(os.getpid()))
+                stamp = time.time() - (backstop + 60)
+                os.utime(mk, (stamp, stamp))
+                t = dashboard.watcher_status_text()
+                assert ("mutation marker: STRANDED (holder pid %d alive but past"
+                        " the %ds backstop" % (os.getpid(), backstop)) in t, t
+                assert ('mutation marker: <b>STRANDED</b> (pid %d past the age '
+                        'backstop' % os.getpid()) in page_with_marker(), t
+                assert ("marker file: %s" % mk) in t, t
+            finally:
+                if saved_marker is None:
+                    os.environ.pop("_SELFTEST_MUTATION_MARKER", None)
+                else:
+                    os.environ["_SELFTEST_MUTATION_MARKER"] = saved_marker
+
+            # wrong-typed arguments are schema-rejected like every other tool
+            e = mcp_server.call_tool("dashboard_status", {"x": 1})
+            assert e["isError"] is True, e
+            assert "unknown argument(s) x" in e["content"][0]["text"], e
+    finally:
+        if saved is None:
+            os.environ.pop("DASHBOARD_PIDFILE", None)
+        else:
+            os.environ["DASHBOARD_PIDFILE"] = saved
+    return ("dispatch + 4 watcher states + pending shutdown requests + "
+            "5 marker states + page chips pinned")
+
+
 def t_mcp_arguments_are_typed():
     """MCP tool arguments are validated, not silently reinterpreted.
 
@@ -950,6 +1637,19 @@ def t_mcp_stdio_end_to_end():
                     "arguments": {"paths": [target],
                                   "models": ["fake:1b", "fake:2b"]},
                 }),
+                # dashboard_status over the wire: read-only watcher report,
+                # asserted state-agnostically (CI has no watcher; a dev box
+                # may - both must satisfy the same shape contract).
+                frame(8, "tools/call", {
+                    "name": "dashboard_status",
+                    "arguments": {},
+                }),
+                # Same tool, unknown argument: the schema guard must fire
+                # over the wire exactly as it does in-process.
+                frame(9, "tools/call", {
+                    "name": "dashboard_status",
+                    "arguments": {"stale": "yes"},
+                }),
             ]
             here = os.path.dirname(os.path.abspath(__file__))
             proc = subprocess.run(
@@ -961,8 +1661,8 @@ def t_mcp_stdio_end_to_end():
             assert proc.returncode == 0, (proc.returncode, proc.stderr[-400:])
 
             lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
-            assert len(lines) == 7, (
-                "expected 7 response lines (notification silent), got %d; "
+            assert len(lines) == 9, (
+                "expected 9 response lines (notification silent), got %d; "
                 "stdout=%r" % (len(lines), proc.stdout[:400]))
             by_id = {}
             for ln in lines:
@@ -973,7 +1673,7 @@ def t_mcp_stdio_end_to_end():
             init = by_id[1]["result"]
             assert init["serverInfo"]["name"] == "ollama-reviewer", init
             tools = [t["name"] for t in by_id[2]["result"]["tools"]]
-            assert "ollama_review_file" in tools and len(tools) == 4, tools
+            assert "ollama_review_file" in tools and len(tools) == 5, tools
 
             ok = by_id[3]["result"]
             assert ok["isError"] is False, ok
@@ -1015,11 +1715,27 @@ def t_mcp_stdio_end_to_end():
             assert "only fake:1b" not in section, section
             assert "only fake:1b" in t7, t7[:600]
             assert "Status: **partial**" in t7, t7[:600]
+
+            dash = by_id[8]["result"]   # watcher report over the wire
+            assert dash["isError"] is False, dash
+            t8 = dash["content"][0]["text"]
+            assert "dashboard watcher:" in t8 and "lock:" in t8, t8
+            # Shape agreement, whichever state the host is in: text and the
+            # not-running/running wording must not contradict each other.
+            if "not running" in t8:
+                assert "stale" in t8 or "pid" in t8, t8
+            else:
+                assert "running (pid " in t8, t8
+
+            dash_bad = by_id[9]["result"]  # schema guard over the wire
+            assert dash_bad["isError"] is True, dash_bad
+            assert "unknown argument(s) stale" in (
+                dash_bad["content"][0]["text"]), dash_bad
     finally:
         srv.close()
 
-    return ("spawned stdio server: 8 frames in, 7 responses out, clean, "
-            "consensus and degraded runs via fake ollama")
+    return ("spawned stdio server: 10 frames in, 9 responses out, clean, "
+            "consensus, degraded run and dashboard_status via fake ollama")
 
 
 def t_render_never_crashes():
@@ -2080,19 +2796,75 @@ MUTATIONS = [
         "checks": ["orchestration + focus decoupled",
                    "mcp: tool arguments are typed"],
     },
+    {
+        "name": "watcher lock acquire removed",
+        "file": "dashboard.py",
+        "old": "        ok, holder = _claim(PID_PATH)\n",
+        "new": "        pass  # lock acquire removed by mutation\n",
+        "checks": ["dashboard: watcher pidfile lock"],
+    },
+    {
+        "name": "watcher lock refuse branch disabled",
+        "file": "dashboard.py",
+        "old": "        if holder and pid_alive(holder):\n            return False, holder\n",
+        "new": "        if False and holder and pid_alive(holder):\n            return False, holder\n",
+        "checks": ["dashboard: watcher pidfile lock"],
+    },
+    {
+        "name": "dashboard_status dispatch removed",
+        "file": "mcp_server.py",
+        "old": "        if name == \"dashboard_status\":\n            import dashboard  # local: only this tool touches the dashboard\n            return _ok(dashboard.watcher_status_text())\n",
+        "new": "",
+        "checks": ["mcp: dashboard_status tool"],
+    },
+    {
+        "name": "concurrent-run wait removed",
+        "file": "selftest.py",
+        "old": "_wait_for_quiescence()\n\nimport cli  # noqa: E402",
+        "new": "import cli  # noqa: E402",
+        "checks": ["selftest: coordinates concurrent runs"],
+    },
+    {
+        "name": "marker holder liveness check removed",
+        "file": "selftest.py",
+        "old": "    if holder.isdigit() and not pidutil.pid_alive(int(holder)):\n",
+        "new": "    if False and holder.isdigit() and not pidutil.pid_alive(int(holder)):\n",
+        "checks": ["selftest: coordinates concurrent runs"],
+    },
+    {
+        "name": "mutation journal heal disabled",
+        "file": "selftest.py",
+        "old": "    with open(path, \"wb\") as fh:\n        fh.write(original)\n",
+        "new": "    if True:  # journal heal disabled by mutation\n        pass\n",
+        "checks": ["selftest: coordinates concurrent runs"],
+    },
+    {
+        "name": "watcher stop wake removed",
+        "file": "dashboard.py",
+        "old": "            if os.path.exists(_sentinel_path(kind)):\n                return kind\n",
+        "new": "            if os.path.exists(_sentinel_path(kind)):\n                pass\n",
+        "checks": ["dashboard: watcher stops cleanly",
+                   "dashboard: --pause freezes a final page"],
+    },
+    {
+        "name": "watcher pause final render removed",
+        "file": "dashboard.py",
+        "old": "            _cycle(n + 1, \"pause requested\", args)  # freeze the artifact fresh\n            return\n",
+        "new": "            return\n",
+        "checks": ["dashboard: --pause freezes a final page"],
+    },
+    {
+        "name": "shutdown request status removed",
+        "file": "dashboard.py",
+        "old": ("    return \"%s\\nlock: %s\\n%s\\n%s\\nmarker file: %s\" % (\n"
+                "        first, st[\"pidfile\"], _pending_line(st[\"pending\"]),\n"
+                "        _marker_line(ms), ms[\"path\"])"),
+        "new": ("    return \"%s\\nlock: %s\\n%s\\nmarker file: %s\" % (\n"
+                "        first, st[\"pidfile\"],\n"
+                "        _marker_line(ms), ms[\"path\"])"),
+        "checks": ["mcp: dashboard_status tool"],
+    },
 ]
-
-
-def _clear_pycache():
-    """Drop compiled caches under scripts/ so the next import sees source.
-
-    mtime+size pyc validation can miss a same-size mutation-restore cycle
-    that lands within one mtime second.
-    """
-    here = os.path.dirname(os.path.abspath(__file__))
-    cache = os.path.join(here, "__pycache__")
-    if os.path.isdir(cache):
-        shutil.rmtree(cache, ignore_errors=True)
 
 
 def _run_mutations():
@@ -2105,7 +2877,15 @@ def _run_mutations():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     argv = [sys.executable, os.path.abspath(__file__), "--offline"]
-    base = subprocess.run(argv, capture_output=True, text=True, timeout=900, cwd=here)
+    # Hold the marker for the whole run: unrelated concurrent runs wait or
+    # skip honestly instead of importing mutated sources. Our own children
+    # carry _MUTATOR_ENV and stay strict - mutation verification requires it.
+    with open(_MUTATION_MARKER, "w") as fh:
+        fh.write(str(os.getpid()))
+    atexit.register(_clear_mutation_marker)  # normal exit, sys.exit, crash
+    mutenv = dict(os.environ, **{_MUTATOR_ENV: str(os.getpid())})
+    base = subprocess.run(argv, capture_output=True, text=True, timeout=900,
+                          cwd=here, env=mutenv)
     assert base.returncode == 0, "baseline suite must pass before mutating:\n%s" % (
         base.stdout[-1500:],)
     print("baseline: offline suite green\n")
@@ -2118,6 +2898,9 @@ def _run_mutations():
         if mut["old"] not in src:
             bad.append((mut["name"], "anchor no longer matches - update it"))
             continue
+        with open(path, "rb") as fh:  # journaled before the rewrite, always
+            original_bytes = fh.read()
+        _write_mutation_journal(mut["name"], mut["file"], original_bytes)
         try:
             with open(path, "w", encoding="utf-8", newline="") as fh:
                 fh.write(src.replace(mut["old"], mut["new"], 1))
@@ -2126,7 +2909,7 @@ def _run_mutations():
                 child_args += ["--mutate-check", c]
             run = subprocess.run(
                 child_args,
-                capture_output=True, text=True, timeout=900, cwd=here)
+                capture_output=True, text=True, timeout=900, cwd=here, env=mutenv)
             # The runner prints "<name padded> STATUS <detail>"; recover
             # exact check names (they contain spaces and colons, so split()
             # is not an option - slice at the status word instead).
@@ -2147,6 +2930,7 @@ def _run_mutations():
             with open(path, "w", encoding="utf-8", newline="") as fh:
                 fh.write(src)
             _clear_pycache()
+            _clear_mutation_journal()
 
         print("mutate: %-44s caught by %s" % (
             mut["name"], ", ".join(c.split(":")[0] for c in mut["checks"])))
@@ -2162,31 +2946,165 @@ def _run_mutations():
     return 0
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--live", action="store_true", help="also run real inference")
-    ap.add_argument(
-        "--offline",
-        action="store_true",
-        help="skip checks needing a live Ollama server (for CI)",
-    )
-    ap.add_argument(
-        "--check", action="append", metavar="SUBSTR",
-        help="run only checks whose name contains this substring; may repeat. "
-        "Fails loudly when nothing matches, so CI cannot green-pass a typo",
-    )
-    ap.add_argument(
-        "--mutate", action="store_true",
-        help="apply registered mutations and require their checks to fail "
-        "(meta-verification that the guards have teeth; not part of the suite)",
-    )
-    ap.add_argument(
-        "--mutate-check", action="append", metavar="SUBSTR",
-        help=argparse.SUPPRESS)  # internal: used by _run_mutations' subprocess
-    args = ap.parse_args()
-    if args.mutate:
-        return _run_mutations()
+def t_selftest_coordinates_concurrent_runs():
+    """The wait-for-quiescence gate must actually gate.
 
+    Spawns a filtered child suite against a privately held mutation marker:
+    the path is env-seamed, so the ambient marker - held for the whole run
+    when this check itself runs under --mutate - cannot deadlock the child,
+    and a concurrent real mutate cannot make the child import mutated
+    sources. The child must block before importing, say so on stderr, and
+    then pass. Removal of the _wait_for_quiescence call fails this. Holder
+    liveness is pinned too: a marker whose holder pid died clears at once,
+    while unparseable content stays age-governed.
+    """
+    import threading
+    here = os.path.dirname(os.path.abspath(__file__))
+    with _tmpdir() as tmp:
+        marker = os.path.join(tmp, "mutating")
+        release = threading.Event()
+
+        def hold():
+            with open(marker, "w") as fh:
+                fh.write("held")
+            release.wait(6)  # hold ~6s, then release
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+
+        threading.Thread(target=hold, daemon=True).start()
+        for _ in range(20):  # spawn only once the marker provably exists
+            if os.path.exists(marker):
+                break
+            time.sleep(0.1)
+        env = {k: v for k, v in os.environ.items() if k != _MUTATOR_ENV}
+        env["_SELFTEST_MUTATION_MARKER"] = marker
+        t0 = time.time()
+        child = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--offline",
+             "--check", "config loads"],
+            capture_output=True, text=True, timeout=300, cwd=here, env=env)
+        elapsed = time.time() - t0
+        release.set()
+        assert child.returncode == 0, (child.returncode, child.stderr[-300:])
+        assert "waiting for it" in child.stderr, (
+            "child did not wait out the mutation marker: %r" % child.stderr[-200:])
+        assert elapsed >= 5, "child too fast to have waited: %.1fs" % elapsed
+        assert "1 passed" in child.stdout, child.stdout[-200:]
+
+        # Holder liveness, pinned in-process against a private marker (never
+        # the ambient one): a dead holder's marker clears at once - the same
+        # recovery the dashboard pidfile lock applies - instead of limboing
+        # for the 950s age backstop. Unparseable content ("held", what the
+        # spawned child above waits on) stays age-governed.
+        global _MUTATION_MARKER
+        saved_marker = _MUTATION_MARKER
+        saved_env = os.environ.get(_MUTATOR_ENV)
+        os.environ.pop(_MUTATOR_ENV, None)  # pins must walk the unsanctioned path
+        try:
+            _MUTATION_MARKER = os.path.join(tmp, "ambient")
+            with open(_MUTATION_MARKER, "w") as fh:  # a killed session's leftover
+                fh.write(str(1 << 30))
+            assert not _mutation_in_flight(), "dead holder's marker must not gate"
+            assert not os.path.exists(_MUTATION_MARKER), (
+                "dead holder's marker must be cleared, not left to age out")
+            with open(_MUTATION_MARKER, "w") as fh:  # live holder: this process
+                fh.write(str(os.getpid()))
+            assert _mutation_in_flight(), "live holder's marker must gate"
+            assert os.path.exists(_MUTATION_MARKER), (
+                "live holder's marker must survive the check")
+            os.remove(_MUTATION_MARKER)
+            with open(_MUTATION_MARKER, "w") as fh:  # unparseable content
+                fh.write("garbage")
+            assert _mutation_in_flight() and os.path.exists(_MUTATION_MARKER), (
+                "unparseable content must stay age-governed")
+            os.remove(_MUTATION_MARKER)
+
+            # Journal heal: a --mutate run journals a module's original bytes
+            # before each rewrite; a journal that outlives its run restores
+            # them on the next suite's contact. The journal follows the
+            # marker's seam, so these stay on private paths.
+            journal = _MUTATION_MARKER + ".journal"
+            target = os.path.join(tmp, "muttarget.py")
+            payload = b"original = 1\n"
+            entry = {"name": "mut X",
+                     "file": os.path.relpath(target, here),
+                     "content_b64": base64.b64encode(payload).decode("ascii")}
+            with open(target, "wb") as fh:  # as a killed run leaves it
+                fh.write(b"mutated = 2\n")
+            with open(journal, "w", encoding="utf-8") as fh:
+                json.dump(entry, fh)
+            _heal_mutation_journal()
+            with open(target, "rb") as fh:
+                assert fh.read() == payload, "journal must restore the original"
+            assert not os.path.exists(journal), "healed journal must be cleared"
+
+            with open(journal, "w", encoding="utf-8") as fh:  # already restored
+                json.dump(entry, fh)
+            _heal_mutation_journal()
+            assert not os.path.exists(journal), "stale journal must be dropped"
+
+            with open(journal, "w", encoding="utf-8") as fh:  # a sanctioned child
+                json.dump(entry, fh)
+            os.environ[_MUTATOR_ENV] = saved_env or "1"
+            _heal_mutation_journal()
+            os.environ.pop(_MUTATOR_ENV, None)
+            assert os.path.exists(journal), "the mutator's own child must never heal"
+
+            src = open(os.path.join(here, "selftest.py"), encoding="utf-8").read()
+            assert "\n    _heal_mutation_journal()  # refuses" in src, (
+                "the quiescence gate must heal a dead run's journal")
+            os.remove(journal)
+        finally:
+            _MUTATION_MARKER = saved_marker
+            if saved_env is not None:
+                os.environ[_MUTATOR_ENV] = saved_env
+    return ("child suite waited out a held marker (%.0fs), then ran clean; "
+            "dead holder clears at once, garbage stays age-governed") % elapsed
+
+
+def t_doc_counts_match_roster():
+    """README/CONTRIBUTING claim the suite's size; drift must fail the build.
+
+    Every new check used to require a human to remember four hardcoded
+    counts across three docs - and one release shipped with them stale.
+    The roster (_build_checks) is the single source of truth; this check
+    derives the true totals from it and pins the docs to match, so doc
+    drift fails CI instead of waiting for a reader to notice.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    total = len(_build_checks(True))
+    offline = sum(1 for name, _ in _build_checks(True) if name not in NEEDS_SERVER)
+    readme = open(os.path.join(here, os.pardir, "README.md"),
+                  encoding="utf-8").read()
+    contributing = open(os.path.join(here, os.pardir, "CONTRIBUTING.md"),
+                        encoding="utf-8").read()
+    rm = re.search(r"(\d+) checks should pass \((\d+) without a running", readme)
+    assert rm, "README lost its check-count sentence"
+    assert int(rm.group(1)) == total, (
+        "README claims %s checks, roster has %d" % (rm.group(1), total))
+    assert int(rm.group(2)) == offline, (
+        "README claims %s offline, roster has %d" % (rm.group(2), offline))
+    cm = re.search(r"all (\d+) checks \(needs Ollama running\)", contributing)
+    assert cm and int(cm.group(1)) == total, (
+        "CONTRIBUTING claims %s checks, roster has %d" % (
+            cm.group(1) if cm else "?", total))
+    cm2 = re.search(r"--offline\s+# (\d+) checks, no server needed", contributing)
+    assert cm2 and int(cm2.group(1)) == offline, (
+        "CONTRIBUTING claims %s offline, roster has %d" % (
+            cm2.group(1) if cm2 else "?", offline))
+    dash = open(os.path.join(here, "dashpage.py"), encoding="utf-8").read()
+    dm = re.search(r"<b>(\d+)-mutation registry</b>", dash)
+    assert dm and int(dm.group(1)) == len(MUTATIONS), (
+        "dashpage.py claims %s mutations, registry has %d" % (
+            dm.group(1) if dm else "?", len(MUTATIONS)))
+    return "docs claim %d live / %d offline; dashboard pins %d mutations" % (
+        total, offline, len(MUTATIONS))
+
+
+def _build_checks(live):
+    """The check roster, one place: doc-count assertions derive from it."""
     checks = [
         ("config loads", t_config),
         ("server reachable", t_server_reachable),
@@ -2251,10 +3169,47 @@ def main():
         ("render: budget shown in markdown", t_markdown_shows_budget),
         ("render: degradations section", t_markdown_degradations_section),
         ("cli: repeated flags never silent", t_repeated_flags_neither_silent),
+        ("dashboard: watcher pidfile lock", t_dashboard_lock_is_exclusive),
+        ("dashboard: watcher wakes on source edit", t_dashboard_watch_reacts_to_disk),
+        ("dashboard: degraded cycles explain themselves", t_dashboard_degraded_cycles_explain_themselves),
+        ("dashboard: watcher stops cleanly", t_dashboard_watcher_stops_cleanly),
+        ("dashboard: --pause freezes a final page", t_dashboard_pause_freezes_a_final_page),
+        ("mcp: dashboard_status tool", t_mcp_dashboard_status_tool),
+        ("doc counts match the roster", t_doc_counts_match_roster),
+        ("selftest: coordinates concurrent runs", t_selftest_coordinates_concurrent_runs),
     ]
-    if args.live:
+    if live:
         checks.append(("live review of planted defects", t_live_review))
     checks.append(("fixtures leave no temp residue", t_tempdir_leaves_no_residue))
+    return checks
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--live", action="store_true", help="also run real inference")
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip checks needing a live Ollama server (for CI)",
+    )
+    ap.add_argument(
+        "--check", action="append", metavar="SUBSTR",
+        help="run only checks whose name contains this substring; may repeat. "
+        "Fails loudly when nothing matches, so CI cannot green-pass a typo",
+    )
+    ap.add_argument(
+        "--mutate", action="store_true",
+        help="apply registered mutations and require their checks to fail "
+        "(meta-verification that the guards have teeth; not part of the suite)",
+    )
+    ap.add_argument(
+        "--mutate-check", action="append", metavar="SUBSTR",
+        help=argparse.SUPPRESS)  # internal: used by _run_mutations' subprocess
+    args = ap.parse_args()
+    if args.mutate:
+        return _run_mutations()
+
+    checks = _build_checks(args.live)
 
     if args.check or args.mutate_check:
         needles = (args.check or []) + (args.mutate_check or [])
@@ -2266,6 +3221,8 @@ def main():
     for name, fn in checks:
         if args.offline and name in NEEDS_SERVER:
             skip(name, "offline mode: needs a live Ollama server")
+        elif _mutation_in_flight() and name in MUTATION_SENSITIVE:
+            skip(name, "concurrent --mutate in flight: source reads would lie")
         else:
             check(name, fn)
 

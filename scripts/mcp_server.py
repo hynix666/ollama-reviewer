@@ -140,6 +140,17 @@ TOOLS = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "dashboard_status",
+        "description": (
+            "Report the dashboard watcher's state: running or not, the holder "
+            "pid, lock-pidfile staleness and path; any pending shutdown request "
+            "(stop/pause sentinel - one outliving a dead watcher would be "
+            "honored by the next watcher); and the selftest mutation marker: "
+            "in flight, stranded, or none, with holder pid and file path. Read-only."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 KNOWN_TOOLS = frozenset(t["name"] for t in TOOLS)
@@ -147,10 +158,7 @@ KNOWN_TOOLS = frozenset(t["name"] for t in TOOLS)
 
 def _schema_for(name):
     """The advertised inputSchema for a tool, or None if unadvertised."""
-    for t in TOOLS:
-        if t["name"] == name:
-            return t.get("inputSchema")
-    return None
+    return next((t.get("inputSchema") for t in TOOLS if t["name"] == name), None)
 
 
 def _ok(text):
@@ -259,6 +267,10 @@ def call_tool(name, args):
                 "Unknown tool: %s. Available: %s."
                 % (name, ", ".join(sorted(KNOWN_TOOLS))))
         _check_types(name, args)
+        if name == "dashboard_status":
+            import dashboard  # local: only this tool touches the dashboard
+            return _ok(dashboard.watcher_status_text())
+
         if name == "ollama_list_models":
             return _ok(render.status_markdown(
                 oc.status_snapshot(cfg, None, notes))
@@ -324,13 +336,11 @@ def dispatch(msg):
         return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
     if method == "initialize":
-        return result(
-            {
-                "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            }
-        )
+        return result({
+            "protocolVersion": params.get("protocolVersion") or PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        })
     if method == "ping":
         return result({})
     if method == "tools/list":
@@ -345,10 +355,7 @@ def dispatch(msg):
 
 
 def _no_duplicate_keys(pairs):
-    """json object_pairs_hook: a duplicated JSON key is ambiguous - RFC 8259
-    lets implementations pick any behavior, and Python's dict builder quietly
-    keeps the last (`{"staged": false, "staged": true}` would review staged
-    changes when the caller said not to). Reject instead: parse error."""
+    """json object_pairs_hook: duplicated JSON keys are ambiguous (RFC 8259) - reject."""
     out = {}
     for k, v in pairs:
         if k in out:
@@ -368,32 +375,24 @@ def serve(stdin=None, stdout=None):
         try:
             msg = json.loads(line, object_pairs_hook=_no_duplicate_keys)
         except (ValueError, TypeError):
-            out = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }
+            out = {"jsonrpc": "2.0", "id": None,
+                   "error": {"code": -32700, "message": "Parse error"}}
         else:
             try:
                 out = dispatch(msg)
             except Exception as e:
                 sys.stderr.write(traceback.format_exc())
-                out = {
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "error": {"code": -32603, "message": "Internal error: %r" % (e,)},
-                }
+                out = {"jsonrpc": "2.0", "id": msg.get("id"),
+                       "error": {"code": -32603, "message": "Internal error: %r" % (e,)}}
         if out is None:
             continue
         try:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()
         except (BrokenPipeError, OSError, ValueError):
-            # The client went away mid-write. That is a normal shutdown, not a
-            # fault: exit quietly rather than dumping a traceback.
+            # The client went away mid-write: a normal shutdown, not a fault.
             return 0
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(serve())
+if __name__ == "__main__": sys.exit(serve())

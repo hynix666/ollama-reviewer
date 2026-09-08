@@ -42,11 +42,15 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 65 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 61 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 73 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 69 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
 python scripts/selftest.py --mutate   # proves each regression guard has teeth
 ```
+
+When you add a check, update the counts above — `doc counts match the roster`
+derives the true totals from the check roster and fails CI if README or this
+file's counts drift.
 
 CI runs `--offline` across Python 3.9–3.13 on Linux, Windows and macOS, byte-compiles
 the sources on Python 3.8 (the floor badge, not the suite), and syntax-checks both
