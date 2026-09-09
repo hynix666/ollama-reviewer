@@ -53,7 +53,8 @@ derives the true totals from the check roster and fails CI if README or this
 file's counts drift.
 
 CI runs `--offline` across Python 3.9–3.13 on Linux, Windows and macOS, byte-compiles
-the sources on Python 3.8 (the floor badge, not the suite), and syntax-checks both
+the sources on Python 3.8 (the floor badge, not the suite), applies the mutation
+registry with `--mutate` so guard decay fails the PR, and syntax-checks both
 installers. All jobs must pass before a merge.
 
 ## Two hard rules

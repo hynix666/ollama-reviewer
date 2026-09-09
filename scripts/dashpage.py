@@ -42,6 +42,7 @@ footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(
 
 JOBS = [
     ("test", "6-OS x Python 3.8-3.13 matrix, full offline suite (65 checks)"),
+    ("mutation-guards", "--mutate: all 24 registry mutations applied, every guard must fire"),
     ("mcp-stdio", "dedicated runner: spawned-process JSON-RPC end-to-end, --check mcp"),
     ("installers", "bash -n, PowerShell parse, executable bit, LF endings"),
 ]
@@ -50,7 +51,8 @@ HARDENING = [
     "actions pinned to <b>release SHAs</b>, not mutable tags",
     "per-job <b>least-privilege</b> token grants (contents: read / none)",
     "concurrency namespaced by <b>workflow x event x ref</b>",
-    "no dependency cache: suite is <b>pure standard library</b>, documented in ci.yml",        "guard decay fails loudly: <b>24-mutation registry</b> via selftest --mutate",
+    "no dependency cache: suite is <b>pure standard library</b>, documented in ci.yml",
+    "guard decay fails loudly: <b>24-mutation registry</b> via selftest --mutate",
 ]
 
 _JP = {
