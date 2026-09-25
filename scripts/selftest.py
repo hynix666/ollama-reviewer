@@ -127,6 +127,24 @@ def _write_mutation_journal(name, rel, original_bytes):
     os.replace(tmp, _journal_path())
 
 
+def _journal_rel(target, here):
+    """Journal `file` as a real run writes it - relative to the scripts dir -
+    falling back to the absolute path where no relative form exists.
+
+    Windows: a path and a start on different drives have no relative form, and
+    os.path.relpath raises ValueError instead of returning one. A fixture in
+    the OS temp dir hits exactly that when the checkout sits on another drive
+    (GitHub's Windows runners: workspace on D:, temp on C:). The fallback stays
+    faithful to heal, which resolves the entry with os.path.join(here, rel) -
+    an absolute second argument wins - so the same bytes come back either way.
+    Production never takes this branch: every mutation targets a module inside
+    the scripts dir, so its entries are relative on every platform."""
+    try:
+        return os.path.relpath(target, here)
+    except ValueError:
+        return target
+
+
 def _heal_mutation_journal():
     """Restore sources if a dead --mutate run left a mutation applied.
 
@@ -3071,7 +3089,7 @@ def t_selftest_coordinates_concurrent_runs():
             target = os.path.join(tmp, "muttarget.py")
             payload = b"original = 1\n"
             entry = {"name": "mut X",
-                     "file": os.path.relpath(target, here),
+                     "file": _journal_rel(target, here),
                      "content_b64": base64.b64encode(payload).decode("ascii")}
             with open(target, "wb") as fh:  # as a killed run leaves it
                 fh.write(b"mutated = 2\n")
