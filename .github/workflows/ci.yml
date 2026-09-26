@@ -41,9 +41,14 @@ jobs:
       # has already paid for it once: Python 3.8 builds stopped existing when
       # ubuntu-latest reached 24.04, which is why the 3.8 leg sits on 22.04.
       # Pinning costs no patches - GitHub keeps a supported image updated in
-      # place - it costs owed maintenance, and that is what the vocabulary in
-      # selftest's "ci: runner images pinned to known labels" is for: a typo, a
-      # retired label or a new -latest fails the suite instead of reaching CI.
+      # place - it costs owed maintenance, and scripts/runner_images.py is
+      # where that debt is paid, in two halves checked where each can be
+      # checked. Offline: the suite check "ci: runner images pinned to known
+      # labels" refuses a typo, an unchecked image or a floating -latest
+      # without touching the network. Live: the "runner images still exist
+      # upstream" job compares the pins against GitHub's published list, which
+      # is the only thing that can see a retirement - and the suite stays
+      # offline on purpose, so a docs.github.com hiccup cannot red a PR.
       # Upgrade a pin when the migration is reviewed, not when the label moves
       # under us (ubuntu-26.04 is already offered; ubuntu-latest still
       # resolves to ubuntu-24.04, so that is today's pin).
@@ -196,3 +201,28 @@ jobs:
             exit 1
           fi
           echo "install.sh is LF-clean"
+
+  # The live half of the pinning policy, and the only job that reads the
+  # network. GitHub retires a hosted image months after announcing it, and a
+  # retired pin stops starting jobs; comparing the pins against GitHub's own
+  # published labels turns that into one clear red here, off the critical path
+  # of the offline suite, where an upstream hiccup would look like a bad pin.
+  # A failure names the image and the fix: pin the replacement and add it to
+  # CHECKED_IMAGES in the same PR.
+  runner-images:
+    name: runner images still exist upstream
+    runs-on: ubuntu-24.04
+    # Checkout plus one HTTPS read of GitHub's public reference page. Nothing
+    # else touches the token (same private-repo caveat as mcp-stdio if
+    # checkout ever needs contents: read).
+    permissions:
+      contents: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Compare the pinned images against GitHub's published list
+        run: python scripts/runner_images.py --live

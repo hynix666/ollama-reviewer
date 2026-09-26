@@ -648,101 +648,88 @@ def t_modules_stay_focused():
     return "all tool modules within %d lines" % limit
 
 
-# Runner images ci.yml may pin to: the standard GitHub-hosted labels this repo
-# has checked, read off GitHub's "GitHub-hosted runners" reference for public
-# repositories on 2026-09-26 (and off the run logs, which name the image each
-# -latest resolved to that day). A label that is not here is a typo, a retired
-# image or a floating -latest - the check below refuses all three, so this
-# tuple is the whole meaning of "pinned". Labels GitHub adds later are
-# deliberate additions, dated with the day the reference was re-read; the
-# upgrade itself belongs in the same PR as the pin, never ahead of it.
-PINNED_RUNNER_IMAGES = (
-    # Linux x64
-    "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04",
-    # Windows x64
-    "windows-2022", "windows-2025", "windows-2025-vs2026",
-    # macOS arm64
-    "macos-14", "macos-15", "macos-26",
-)
-
-
-def _ci_job_ids(text):
-    """The workflow's job ids: the 2-space keys under `jobs:`."""
-    body = text.split("\njobs:", 1)[-1]
-    return re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\s*$", body)
-
-
-def _ci_image_labels(text):
-    """(line number, label) for every runner image a workflow asks for.
-
-    Both shapes ci.yml uses: a literal `runs-on:` value, and the `os:` values
-    of matrix entries - an `include` line or a bracketed list. `${{ matrix.os
-    }}` is not a label: the values it stands for are collected from the same
-    pass, so an expression can neither add a label nor hide one.
-    """
-    found = []
-    for n, ln in enumerate(text.splitlines(), 1):
-        m = re.search(r"(?:^|\s)runs-on:\s*(\S.*?)\s*$", ln)
-        if m and not m.group(1).startswith("${{"):
-            found.append((n, m.group(1)))
-        m = re.search(r"(?:^|\s)os:\s*(\S.*?)\s*$", ln)
-        if m:
-            value = m.group(1).strip()
-            if value.startswith("["):  # a bracketed matrix list
-                found += [(n, v.strip()) for v in value.strip("[]").split(",")]
-            else:  # an include entry: `{ os: ubuntu-24.04, python: "3.9" }`
-                found.append((n, value.split(",")[0].strip()))
-    return found
-
-
-def _ci_unknown_images(text, vocabulary=PINNED_RUNNER_IMAGES):
-    """Labels in `text` the vocabulary does not hold, as "line N: label"."""
-    return ["line %d: %s" % (n, v) for n, v in _ci_image_labels(text)
-            if v not in vocabulary]
-
-
 def t_ci_runner_images_are_pinned():
-    """CI asks for pinned runner images, and the vocabulary holds only them.
+    """Every workflow pins an image this repo has checked - and only those.
 
     Pinning keeps a green run meaning the same thing tomorrow: a floating
     -latest retargets every workflow at once, mid-flight, with no PR to review
     (ubuntu-latest moves to Ubuntu 26 on 2026-10-19), and this repo has paid
     for that once already - Python 3.8 builds stopped existing under
-    ubuntu-latest, which is why the 3.8 leg sits on 22.04. The check reads the
-    workflow itself, so it runs wherever the workflow does, and it exercises
-    its own reader against a bogus version, a retired label and a floating one
-    before trusting a green verdict.
+    ubuntu-latest, which is why the 3.8 leg sits on 22.04. Reader and
+    vocabulary live in runner_images.py, one home shared with the live half of
+    the policy, and every shape below is exercised here because a parser that
+    cannot read legitimate YAML would report a red that is a lie. Existence is
+    the other half's job: it needs the network, and `runner_images.py --live`
+    is the CI job that reads GitHub's own list, so the suite stays offline.
     """
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, os.pardir, ".github", "workflows", "ci.yml"),
-              encoding="utf-8") as fh:
-        text = fh.read()
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import runner_images
 
-    jobs = _ci_job_ids(text)
-    runs_on = re.findall(r"(?m)^\s*runs-on:\s*(\S.*?)\s*$", text)
-    assert jobs and len(runs_on) == len(jobs), (
-        "every job must declare runs-on (%d jobs, %d runs-on lines) - the "
-        "image policy cannot see what it cannot parse" % (len(jobs), len(runs_on)))
-    assert _ci_image_labels(text), "no runner image labels parsed out of ci.yml"
-    unknown = _ci_unknown_images(text)  # expected empty: every pin is known
-    assert not unknown, (
-        "ci.yml asks for images this repo has not checked - a typo, a retired "
-        "label, or a floating -latest? %s" % "; ".join(unknown))
+    paths = runner_images.workflow_paths()
+    assert paths, "no workflow files found under .github/workflows"
+    pins = runner_images.workflow_pins(paths)
+    assert pins, "no image pins parsed out of %s" % ", ".join(paths)
+    pinned = sorted({label for _, _, label in pins})
+    unchecked = runner_images.unknown(pinned)
+    assert not unchecked, (
+        "%s asks for images this repo has not checked: %s - pin a checked "
+        "image, or extend CHECKED_IMAGES in runner_images.py in the same PR "
+        "that pins it"
+        % (", ".join(sorted({p for p, _, _ in pins})), ", ".join(unchecked)))
+    assert set(runner_images.CHECKED_IMAGES) == set(pinned), (
+        "CHECKED_IMAGES must be exactly what the workflows pin - every entry "
+        "is verified against GitHub's list by the live job, so an unused one "
+        "claims a check nobody makes: %s vs %s"
+        % (sorted(runner_images.CHECKED_IMAGES), pinned))
 
-    # Exercised, not merely applied: the reader the workflow is judged by must
-    # refuse a bogus version, a retired label and a floating -latest in the
-    # shapes the workflow uses, or a green verdict here would mean nothing.
-    for probe in ('- { os: ubuntu-99.99, python: "3.9" }',
-                  '- { os: ubuntu-20.04, python: "3.9" }',
-                  "os: [ubuntu-latest, windows-2025]",
-                  "runs-on: macos-latest"):
-        assert _ci_unknown_images("runs-on: ubuntu-24.04\n    %s\n" % probe), (
-            "%r must not pass as a pinned image" % probe)
-    assert not [i for i in PINNED_RUNNER_IMAGES if i.endswith("-latest")], (
-        "the vocabulary must hold pinnable labels only")
-    return ("ci.yml pins %s; %d labels in the vocabulary checked 2026-09-26"
-            % (", ".join(sorted({v for _, v in _ci_image_labels(text)})),
-               len(PINNED_RUNNER_IMAGES)))
+    # A job the reader cannot see would be a silent hole, not a pass: every job
+    # must ask for a runner, and a parse that fails must name the job it could
+    # not read - an underscore id is a job, not a reason to report "0 jobs".
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            jobs = runner_images.job_blocks(fh.read())
+        assert jobs, "%s: no jobs parsed - the policy cannot see it" % path
+        for job, block in jobs:
+            assert re.search(r"(?m)^\s+runs-on:", block) or re.search(
+                r"(?m)^\s+uses:", block), (
+                "%s: job %r declares neither runs-on nor uses - a job the "
+                "policy cannot see is not a job it cleared"
+                % (os.path.basename(path), job))
+
+    # Shapes workflows legitimately write, read the way GitHub reads them:
+    # trailing comments, quoted scalars, a bracketed list carrying a comment,
+    # and a comment body that merely mentions os: - none may become a red, and
+    # the comment must not be mined for a label at all.
+    for shape, expected in (
+            ("runs-on: ubuntu-24.04  # pinned", ["ubuntu-24.04"]),
+            ('runs-on: "ubuntu-24.04"', ["ubuntu-24.04"]),
+            ('os: ["ubuntu-24.04", "windows-2025"]',
+             ["ubuntu-24.04", "windows-2025"]),
+            ("os: [ubuntu-24.04, windows-2025]  # note",
+             ["ubuntu-24.04", "windows-2025"]),
+            ('- { os: ubuntu-24.04, python: "3.9" }', ["ubuntu-24.04"]),
+            ("# keep os: ubuntu-latest in sync", [])):
+        labels = [l for _, _, l in runner_images.pins_in_text("probe.yml", shape)]
+        assert labels == expected, (
+            "%r read as %s, GitHub reads it as %s" % (shape, labels, expected))
+        assert not runner_images.unknown(labels), (
+            "%r is legitimate yaml but was reported as a bad pin" % shape)
+    assert [j for j, _ in runner_images.job_blocks(
+        "jobs:\n  my_job:\n    runs-on: ubuntu-24.04\n")] == ["my_job"], (
+        "a job id with an underscore must parse, not report 0 jobs")
+
+    # ...and what the policy exists to refuse must stay refused.
+    for shape in ("runs-on: ubuntu-latest", "runs-on: ubuntu-99.99",
+                  "os: [ubuntu-24.04, ubuntu-latest]",
+                  '- { os: ubuntu-latest, python: "3.9" }'):
+        labels = [l for _, _, l in runner_images.pins_in_text("probe.yml", shape)]
+        assert labels and runner_images.unknown(labels), (
+            "%r must be read and refused as an unchecked image" % shape)
+    assert not [i for i in runner_images.CHECKED_IMAGES if i.endswith("-latest")], (
+        "CHECKED_IMAGES must hold pinnable labels only")
+    return ("%d workflow file(s) pin %s; image existence is the live job's "
+            "finding (runner_images.py --live), not this half's"
+            % (len(paths), ", ".join(pinned)))
 
 
 def t_dashboard_lock_is_exclusive():

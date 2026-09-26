@@ -41,15 +41,16 @@ footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(
 """
 
 JOBS = [
-    ("test", "6-OS x Python 3.8-3.13 matrix, full offline suite (72 checks)"),
+    ("test", "6 matrix legs on 4 pinned images (3 platforms), Python 3.8-3.13, full offline suite (72 checks)"),
     ("mutation-guards", "--mutate on Linux + Windows: 25-entry registry, every applicable guard must fire (1 windows-only)"),
     ("mcp-stdio", "dedicated runner: spawned-process JSON-RPC end-to-end, --check mcp"),
     ("installers", "bash -n, PowerShell parse, executable bit, LF endings"),
+    ("runner-images", "the one networked check: pins still exist in GitHub's published list"),
 ]
 
 HARDENING = [
     "actions pinned to <b>release SHAs</b>, not mutable tags",
-    "runner images pinned to <b>checked versions</b>, not -latest labels",
+    "runner images pinned to <b>checked versions</b>, existence verified against GitHub's list",
     "per-job <b>least-privilege</b> token grants (contents: read / none)",
     "concurrency namespaced by <b>workflow x event x ref</b>",
     "no dependency cache: suite is <b>pure standard library</b>, documented in ci.yml",

@@ -65,10 +65,19 @@ at once, mid-flight, with no PR to review (the Ubuntu 26 move lands
 2026-10-19), and this repo has already paid for that once: Python 3.8 builds
 stopped existing under `ubuntu-latest`. Pinners still get patches, because
 GitHub keeps a supported image updated in place; what a pin costs is a
-reviewed upgrade later instead of an unannounced one. `ci: runner images
-pinned to known labels` fails the build when the workflow asks for anything
-outside the checked vocabulary in `selftest.py`, so when GitHub retires an
-image, add its replacement to that tuple and move the pin in the same PR.
+reviewed upgrade later instead of an unannounced one.
+
+The policy lives in one home, `scripts/runner_images.py`, in two halves checked
+where each can be checked. The suite runs the offline half (`ci: runner images
+pinned to known labels`): every workflow's image labels must be in
+`CHECKED_IMAGES`, and the reader is exercised on the YAML shapes workflows
+legitimately write, so a red there always means a real pin. Existence needs the
+network, so it is its own job (`runner images still exist upstream`, the only
+networked check) comparing the pins against GitHub's published list. The suite
+stays offline on purpose: a docs.github.com hiccup, and a local run with no
+network, must never red a pull request. When GitHub retires an image that job
+goes red naming it, and the fix is one PR that pins the replacement and adds it
+to `CHECKED_IMAGES`.
 
 One registry entry is declared `windows-only`: the journal-heal cross-drive
 fallback, whose absence can only bite where two paths have no relative form
