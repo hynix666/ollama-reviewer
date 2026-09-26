@@ -648,6 +648,103 @@ def t_modules_stay_focused():
     return "all tool modules within %d lines" % limit
 
 
+# Runner images ci.yml may pin to: the standard GitHub-hosted labels this repo
+# has checked, read off GitHub's "GitHub-hosted runners" reference for public
+# repositories on 2026-09-26 (and off the run logs, which name the image each
+# -latest resolved to that day). A label that is not here is a typo, a retired
+# image or a floating -latest - the check below refuses all three, so this
+# tuple is the whole meaning of "pinned". Labels GitHub adds later are
+# deliberate additions, dated with the day the reference was re-read; the
+# upgrade itself belongs in the same PR as the pin, never ahead of it.
+PINNED_RUNNER_IMAGES = (
+    # Linux x64
+    "ubuntu-22.04", "ubuntu-24.04", "ubuntu-26.04",
+    # Windows x64
+    "windows-2022", "windows-2025", "windows-2025-vs2026",
+    # macOS arm64
+    "macos-14", "macos-15", "macos-26",
+)
+
+
+def _ci_job_ids(text):
+    """The workflow's job ids: the 2-space keys under `jobs:`."""
+    body = text.split("\njobs:", 1)[-1]
+    return re.findall(r"(?m)^  ([a-z][a-z0-9-]*):\s*$", body)
+
+
+def _ci_image_labels(text):
+    """(line number, label) for every runner image a workflow asks for.
+
+    Both shapes ci.yml uses: a literal `runs-on:` value, and the `os:` values
+    of matrix entries - an `include` line or a bracketed list. `${{ matrix.os
+    }}` is not a label: the values it stands for are collected from the same
+    pass, so an expression can neither add a label nor hide one.
+    """
+    found = []
+    for n, ln in enumerate(text.splitlines(), 1):
+        m = re.search(r"(?:^|\s)runs-on:\s*(\S.*?)\s*$", ln)
+        if m and not m.group(1).startswith("${{"):
+            found.append((n, m.group(1)))
+        m = re.search(r"(?:^|\s)os:\s*(\S.*?)\s*$", ln)
+        if m:
+            value = m.group(1).strip()
+            if value.startswith("["):  # a bracketed matrix list
+                found += [(n, v.strip()) for v in value.strip("[]").split(",")]
+            else:  # an include entry: `{ os: ubuntu-24.04, python: "3.9" }`
+                found.append((n, value.split(",")[0].strip()))
+    return found
+
+
+def _ci_unknown_images(text, vocabulary=PINNED_RUNNER_IMAGES):
+    """Labels in `text` the vocabulary does not hold, as "line N: label"."""
+    return ["line %d: %s" % (n, v) for n, v in _ci_image_labels(text)
+            if v not in vocabulary]
+
+
+def t_ci_runner_images_are_pinned():
+    """CI asks for pinned runner images, and the vocabulary holds only them.
+
+    Pinning keeps a green run meaning the same thing tomorrow: a floating
+    -latest retargets every workflow at once, mid-flight, with no PR to review
+    (ubuntu-latest moves to Ubuntu 26 on 2026-10-19), and this repo has paid
+    for that once already - Python 3.8 builds stopped existing under
+    ubuntu-latest, which is why the 3.8 leg sits on 22.04. The check reads the
+    workflow itself, so it runs wherever the workflow does, and it exercises
+    its own reader against a bogus version, a retired label and a floating one
+    before trusting a green verdict.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, os.pardir, ".github", "workflows", "ci.yml"),
+              encoding="utf-8") as fh:
+        text = fh.read()
+
+    jobs = _ci_job_ids(text)
+    runs_on = re.findall(r"(?m)^\s*runs-on:\s*(\S.*?)\s*$", text)
+    assert jobs and len(runs_on) == len(jobs), (
+        "every job must declare runs-on (%d jobs, %d runs-on lines) - the "
+        "image policy cannot see what it cannot parse" % (len(jobs), len(runs_on)))
+    assert _ci_image_labels(text), "no runner image labels parsed out of ci.yml"
+    unknown = _ci_unknown_images(text)  # expected empty: every pin is known
+    assert not unknown, (
+        "ci.yml asks for images this repo has not checked - a typo, a retired "
+        "label, or a floating -latest? %s" % "; ".join(unknown))
+
+    # Exercised, not merely applied: the reader the workflow is judged by must
+    # refuse a bogus version, a retired label and a floating -latest in the
+    # shapes the workflow uses, or a green verdict here would mean nothing.
+    for probe in ('- { os: ubuntu-99.99, python: "3.9" }',
+                  '- { os: ubuntu-20.04, python: "3.9" }',
+                  "os: [ubuntu-latest, windows-2025]",
+                  "runs-on: macos-latest"):
+        assert _ci_unknown_images("runs-on: ubuntu-24.04\n    %s\n" % probe), (
+            "%r must not pass as a pinned image" % probe)
+    assert not [i for i in PINNED_RUNNER_IMAGES if i.endswith("-latest")], (
+        "the vocabulary must hold pinnable labels only")
+    return ("ci.yml pins %s; %d labels in the vocabulary checked 2026-09-26"
+            % (", ".join(sorted({v for _, v in _ci_image_labels(text)})),
+               len(PINNED_RUNNER_IMAGES)))
+
+
 def t_dashboard_lock_is_exclusive():
     """The watcher pidfile lock: claims, refuses rivals, recovers stale files."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -808,6 +905,7 @@ def t_dashboard_degraded_cycles_explain_themselves():
     reads like a regression that never happened."""
     import dashboard
     import dashpage
+    import mutverdict
     note = dashboard._degradation_note("the offline selftest", 1,
                                        "partial output", "boom traceback")
     assert "exit=1" in note and "boom traceback" in note, note
@@ -827,9 +925,9 @@ def t_dashboard_degraded_cycles_explain_themselves():
     assert "&#9888;" in html and "boom traceback" in html and "exit=1" in html, (
         html[-400:])
 
-    page["rows_note"], page["mut_note"] = None, dashboard._degradation_note(
-        "the mutation registry run", 3, "", "baseline assert blew up")
-    page["mut_ok"] = False  # no verdict is not a regression verdict
+    page["rows_note"], page["mut_ok"] = None, False  # no verdict != regression
+    page["mut_note"] = mutverdict._no_verdict(  # the builder the page really uses
+        subprocess.CompletedProcess([], 3, "", "baseline assert blew up"))
     html = dashpage.render(page)
     assert "NO VERDICT" in html and "baseline assert blew up" in html, html[-400:]
     assert "REGRESSION" not in html, "a no-verdict cycle must not claim regression"
@@ -839,6 +937,59 @@ def t_dashboard_degraded_cycles_explain_themselves():
     assert '"rows_note"' in src and '"mut_note"' in src, (
         "gather must carry the degradation notes to the page")
     return "degraded cycles render exit codes and stderr tails as page warnings"
+
+
+def t_dashboard_mutate_verdict_explains_scopes():
+    """A scoped registry entry must reach the page as a platform fact.
+
+    --mutate reports the entries it scoped away instead of counting them,
+    and mutverdict.py is the single reader of that transcript, so the
+    runner's wording is a contract. Both ends are pinned against each other
+    here: the parser is fed the runner's own wording, and the chip built
+    from a parsed verdict says which entries were not exercised here. A
+    reworded transcript then fails this check instead of quietly turning the
+    page's verdict into NO VERDICT - or into a regression that never
+    happened.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import dashpage
+    import mutverdict
+    parse = mutverdict.parse
+
+    page = {"rows": [], "mods": [], "up": True, "n_models": 0, "live": False,
+            "mut_ok": True, "mut_total": 25, "mut_caught": 25, "mut_scoped": 0,
+            "mut_scope": None, "ci": [], "ci_note": None, "commits": [],
+            "tree": "clean",
+            "marker": {"state": "absent", "holder": None,
+                       "holder_alive": None, "age_s": None}}
+
+    only = [_MUTATE_CAUGHT_LINE % 25]
+    assert parse("\n".join(only)) == (25, 25, 0, None, True), only
+
+    both = [_mutate_scoped_line(1, 25, "windows", "posix"),
+            "  - journal cross-drive fallback removed",
+            _MUTATE_CAUGHT_LINE % 24]
+    assert parse("\n".join(both)) == (24, 25, 1, "windows", True), both
+    page["mut_caught"], page["mut_scoped"], page["mut_scope"] = 24, 1, "windows"
+    html = dashpage.render(page)
+    assert "24</b> / 25 caught" in html, html[-400:]
+    assert "1 windows-only, scoped away here" in html, html[-400:]
+
+    red = [_MUTATE_MISSED_LINE % (3, 24)]
+    assert parse("\n".join(red)) == (0, 24, 0, None, False), red
+    assert not parse("no table, no verdict")[4], (
+        "a transcript without a verdict must not read as caught")
+    note = mutverdict._no_verdict(  # the page's warning when no verdict came
+        subprocess.CompletedProcess([], 3, "", "baseline assert blew up"))
+    assert "no verdict (exit=3)" in note and "baseline assert blew up" in note, (
+        note)
+
+    page["mut_caught"], page["mut_scoped"], page["mut_scope"] = 25, 0, None
+    html = dashpage.render(page)
+    assert "25</b> / 25 caught" in html, html[-400:]
+    assert "scoped away" not in html, "an unscoped verdict must not mention scoping"
+    return ("runner wording parses on both platforms; the chip separates "
+            "scoped-away entries from caught ones")
 
 
 def t_dashboard_watcher_stops_cleanly():
@@ -2691,6 +2842,52 @@ def t_live_review():
 # module's __pycache__ is cleared: a same-size mutation-restore cycle can
 # land within one mtime second, and CPython's mtime+size pyc validation
 # would then serve the mutated bytecode as if the source were restored.
+#
+# An entry may also declare "platform": the one scope where its broken form
+# can bite. A scoped entry stays required where that scope holds - the
+# windows legs must catch a windows-only entry - and is reported as scoped
+# away everywhere else, never silently skipped and never counted as caught.
+#
+# Scopes are capability predicates, not names compared against a platform
+# string: a scope whose predicate never held would retire its entry on every
+# platform and still exit green, which is the exact silent decay the
+# registry exists to prevent.
+MUTATION_SCOPES = {
+    "windows": lambda: os.name == "nt",
+    "posix": lambda: os.name != "nt",
+}
+
+
+def _mutation_scope(mut):
+    """An entry's declared platform scope, or None when it bites everywhere.
+
+    A misspelled scope is a hard error, never a skip: it would retire the
+    guard on every platform but the misspelled one."""
+    scope = mut.get("platform")
+    if scope is not None and scope not in MUTATION_SCOPES:
+        raise ValueError("registry entry %r declares unknown platform %r "
+                         "(known: %s)"
+                         % (mut.get("name"), scope, ", ".join(MUTATION_SCOPES)))
+    return scope
+
+
+def _mutation_platform():
+    """The scope name that describes this interpreter, for reporting."""
+    for name in sorted(MUTATION_SCOPES):
+        if MUTATION_SCOPES[name]():
+            return name
+    raise AssertionError("no platform scope matches this interpreter")
+
+
+def _mutation_applies(mut):
+    """True when this entry's broken form can bite on this interpreter.
+
+    Scoping is a capability test, so a windows-only entry is skipped exactly
+    where drive-relative paths cannot exist - not where some string differs."""
+    scope = _mutation_scope(mut)
+    return scope is None or MUTATION_SCOPES[scope]()
+
+
 MUTATIONS = [
     {
         "name": "repeated-flag guard removed",
@@ -2860,6 +3057,17 @@ MUTATIONS = [
         "checks": ["selftest: coordinates concurrent runs"],
     },
     {
+        "name": "journal cross-drive fallback removed",
+        "file": "selftest.py",
+        "old": "    except ValueError:\n        return target\n",
+        "new": "    except ValueError:\n        raise  # cross-drive fallback removed by mutation\n",
+        # Drive-relative paths exist only on Windows: elsewhere relpath always
+        # has a relative form, so this broken form cannot bite there and the
+        # posix legs report the entry as scoped away rather than uncaught.
+        "platform": "windows",
+        "checks": ["selftest: coordinates concurrent runs"],
+    },
+    {
         "name": "watcher stop wake removed",
         "file": "dashboard.py",
         "old": "            if os.path.exists(_sentinel_path(kind)):\n                return kind\n",
@@ -2904,11 +3112,16 @@ def t_no_mutation_residue_in_sources():
     the correct form it replaces - must be absent. Deletions and trimmed
     tails are covered by the anchor alone, since their broken shape is
     either everywhere (empty string) or legitimate code (the tail).
+
+    Each entry's platform scope is checked here too: a misspelled scope
+    would retire that guard on every platform but the misspelled one, the
+    same silent decay the anchors are watched for.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     srcs = {}
     for mut in MUTATIONS:
         rel, old, new = mut["file"], mut["old"], mut["new"]
+        _mutation_scope(mut)
         if rel not in srcs:
             with open(os.path.join(here, rel), encoding="utf-8", newline="") as fh:
                 srcs[rel] = fh.read()
@@ -2924,7 +3137,27 @@ def t_no_mutation_residue_in_sources():
             "%s: the broken form is present in %s (%d hits) - the tree holds "
             "mutated source; restore from git or re-run the suite to heal"
             % (mut["name"], rel, hits))
-    return "all %d anchors exact; no distinguishable broken form present" % len(MUTATIONS)
+    return ("all %d anchors exact, scopes known; no distinguishable broken "
+            "form present" % len(MUTATIONS))
+
+
+# Wording, not decoration: the dashboard parses these lines to put a verdict
+# on the page, so the runner owns the wording and the page's parser is pinned
+# against it (selftest check "dashboard: mutate verdict explains scopes")
+# rather than against a copy that can drift.
+_MUTATE_CAUGHT_LINE = "all %d mutations caught - every guard has teeth"
+_MUTATE_MISSED_LINE = "%d of %d mutations NOT caught"
+
+
+def _mutate_scoped_line(count, total, scope, platform):
+    """The disclosure for entries this platform scoped away, wording and all.
+
+    Named as a function rather than a format constant because the declaring
+    scope is both the entry's own scope and the leg that must catch it, and
+    callers should not have to repeat an argument to say that twice."""
+    return ("%d of %d entries declared %s-only, inert on %s: not exercised "
+            "here, not counted as caught - the %s legs must catch each one:"
+            % (count, total, scope, platform, scope))
 
 
 def _run_mutations():
@@ -2934,6 +3167,11 @@ def _run_mutations():
     subprocess that asserts every named check fails under the mutation and
     that the source is back. A passing baseline first, so a failure means a
     loss of coverage, not a pre-existing break. All mutations run offline.
+
+    An entry scoped to another platform is reported as scoped away - its
+    broken form cannot bite here, so requiring it would be dishonest and
+    skipping it silently would hide a dead guard. The verdict counts the
+    entries this platform exercised.
     """
     here = os.path.dirname(os.path.abspath(__file__))
     argv = [sys.executable, os.path.abspath(__file__), "--offline"]
@@ -2951,12 +3189,20 @@ def _run_mutations():
     print("baseline: offline suite green\n")
 
     bad = []
+    scoped_out = {}
     for mut in MUTATIONS:
         path = os.path.join(here, mut["file"])
         with open(path, "r", encoding="utf-8", newline="") as fh:
             src = fh.read()
         if mut["old"] not in src:
             bad.append((mut["name"], "anchor no longer matches - update it"))
+            continue
+        # Anchors are held to account on every platform, in or out of scope:
+        # a rotted anchor means the entry is dead everywhere, not just here.
+        scope = _mutation_scope(mut)
+        if not _mutation_applies(mut):
+            scoped_out.setdefault(scope, []).append(mut["name"])
+            print("mutate: %-44s scoped away (%s-only)" % (mut["name"], scope))
             continue
         with open(path, "rb") as fh:  # journaled before the rewrite, always
             original_bytes = fh.read()
@@ -2997,12 +3243,22 @@ def _run_mutations():
 
     _clear_pycache()
     print("\n" + "-" * 78)
+    platform = _mutation_platform()
+    for scope, names in sorted(scoped_out.items()):
+        print(_mutate_scoped_line(len(names), len(MUTATIONS), scope, platform))
+        for name in names:
+            print("  - %s" % name)
+    exercised = len(MUTATIONS) - sum(len(n) for n in scoped_out.values())
+    if not exercised:
+        print("every registry entry is scoped away on %s: nothing was "
+              "verified - refusing to report success" % platform)
+        return 1
     if bad:
         for name, why in bad:
             print("MUTATION %s: %s" % (name, why))
-        print("%d of %d mutations NOT caught" % (len(bad), len(MUTATIONS)))
+        print(_MUTATE_MISSED_LINE % (len(bad), exercised))
         return 1
-    print("all %d mutations caught - every guard has teeth" % len(MUTATIONS))
+    print(_MUTATE_CAUGHT_LINE % exercised)
     return 0
 
 
@@ -3080,6 +3336,18 @@ def t_selftest_coordinates_concurrent_runs():
             assert _mutation_in_flight() and os.path.exists(_MUTATION_MARKER), (
                 "unparseable content must stay age-governed")
             os.remove(_MUTATION_MARKER)
+
+            # Drive-relative spelling, pinned by construction: the fixture below
+            # only meets the cross-drive fallback where the workspace and temp
+            # dirs really sit on different drives (GitHub's Windows runners:
+            # workspace D:, temp C:). ntpath compares drive letters as
+            # strings, so this synthetic pair has no relative form on any
+            # Windows box, drives or not - the fallback keeps its teeth on a
+            # one-drive developer machine too.
+            if os.name == "nt":
+                foreign = "Q:\\elsewhere\\muttarget.py"
+                assert _journal_rel(foreign, "R:\\build") == foreign, (
+                    "a cross-drive target must journal its absolute path")
 
             # Journal heal: a --mutate run journals a module's original bytes
             # before each rewrite; a journal that outlives its run restores
@@ -3191,6 +3459,7 @@ def _build_checks(live):
         ("consensus: severity spread", t_consensus_severity_spread),
         ("consensus: messy locations", t_consensus_parses_messy_locations),
         ("modules stay focused", t_modules_stay_focused),
+        ("ci: runner images pinned to known labels", t_ci_runner_images_are_pinned),
         ("orchestration + focus decoupled", t_review_options_decoupled),
         ("client: retries respect budget", t_retries_respect_total_budget),
         ("collect: stdin diff filtered", t_stdin_diff_honours_code_filter),
@@ -3234,6 +3503,7 @@ def _build_checks(live):
         ("dashboard: degraded cycles explain themselves", t_dashboard_degraded_cycles_explain_themselves),
         ("dashboard: watcher stops cleanly", t_dashboard_watcher_stops_cleanly),
         ("dashboard: --pause freezes a final page", t_dashboard_pause_freezes_a_final_page),
+        ("dashboard: mutate verdict explains scopes", t_dashboard_mutate_verdict_explains_scopes),
         ("mcp: dashboard_status tool", t_mcp_dashboard_status_tool),
         ("doc counts match the roster", t_doc_counts_match_roster),
         ("selftest: no mutated source committed", t_no_mutation_residue_in_sources),

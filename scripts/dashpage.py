@@ -41,18 +41,19 @@ footer{margin-top:28px;color:var(--dim);font-size:12px;border-top:1px solid var(
 """
 
 JOBS = [
-    ("test", "6-OS x Python 3.8-3.13 matrix, full offline suite (65 checks)"),
-    ("mutation-guards", "--mutate on Linux + Windows: all 24 registry mutations applied, every guard must fire"),
+    ("test", "6-OS x Python 3.8-3.13 matrix, full offline suite (72 checks)"),
+    ("mutation-guards", "--mutate on Linux + Windows: 25-entry registry, every applicable guard must fire (1 windows-only)"),
     ("mcp-stdio", "dedicated runner: spawned-process JSON-RPC end-to-end, --check mcp"),
     ("installers", "bash -n, PowerShell parse, executable bit, LF endings"),
 ]
 
 HARDENING = [
     "actions pinned to <b>release SHAs</b>, not mutable tags",
+    "runner images pinned to <b>checked versions</b>, not -latest labels",
     "per-job <b>least-privilege</b> token grants (contents: read / none)",
     "concurrency namespaced by <b>workflow x event x ref</b>",
     "no dependency cache: suite is <b>pure standard library</b>, documented in ci.yml",
-    "guard decay fails loudly on both platforms: <b>24-mutation registry</b> via selftest --mutate",
+    "guard decay fails loudly on both platforms: <b>25-mutation registry</b> via selftest --mutate",
 ]
 
 _JP = {
@@ -123,8 +124,12 @@ def render(d, refresh=None):
     )
     hard = "\n".join("      <li>%s</li>" % h for h in HARDENING)
     mut_ok, mut_total = d["mut_ok"], d["mut_total"]
+    mut_caught, mut_scoped = d.get("mut_caught", mut_total), d.get("mut_scoped", 0)
     if mut_ok:
-        mut_chip = "mutations: <b>%d</b> / %d caught" % (mut_total, mut_total)
+        mut_chip = "mutations: <b>%d</b> / %d caught" % (mut_caught, mut_total)
+        if mut_scoped:  # scoped away, not lost: a platform fact, said plainly
+            mut_chip += " (%d %s-only, scoped away here)" % (
+                mut_scoped, d.get("mut_scope") or "platform")
     elif d.get("mut_note"):  # no verdict: a degraded cycle, not a regression
         mut_chip = "mutations: <b>NO VERDICT</b> - degraded cycle, see the warning"
     else:

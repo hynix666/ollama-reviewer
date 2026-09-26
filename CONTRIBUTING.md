@@ -42,8 +42,8 @@ full suite, a running Ollama server with at least one code-capable model.
 ## Running the tests
 
 ```bash
-python scripts/selftest.py            # all 74 checks (needs Ollama running)
-python scripts/selftest.py --offline  # 70 checks, no server needed - what CI runs
+python scripts/selftest.py            # all 76 checks (needs Ollama running)
+python scripts/selftest.py --offline  # 72 checks, no server needed - what CI runs
 python scripts/selftest.py --live     # adds real inference on planted defects
 python scripts/selftest.py --mutate   # proves each regression guard has teeth
 ```
@@ -57,6 +57,24 @@ the sources on Python 3.8 (the floor badge, not the suite), applies the mutation
 registry with `--mutate` on both Linux and Windows so guard decay fails the PR
 on whichever platform it bites, and syntax-checks both installers. All jobs must
 pass before a merge.
+
+Runner images are pinned, never followed through `-latest`: CI asks for
+`ubuntu-24.04`, `windows-2025` and `macos-26` - the images those labels
+resolved to on 2026-09-26 - because a floating label retargets every workflow
+at once, mid-flight, with no PR to review (the Ubuntu 26 move lands
+2026-10-19), and this repo has already paid for that once: Python 3.8 builds
+stopped existing under `ubuntu-latest`. Pinners still get patches, because
+GitHub keeps a supported image updated in place; what a pin costs is a
+reviewed upgrade later instead of an unannounced one. `ci: runner images
+pinned to known labels` fails the build when the workflow asks for anything
+outside the checked vocabulary in `selftest.py`, so when GitHub retires an
+image, add its replacement to that tuple and move the pin in the same PR.
+
+One registry entry is declared `windows-only`: the journal-heal cross-drive
+fallback, whose absence can only bite where two paths have no relative form
+(the workspace and the temp dir on different drives). The Windows leg requires
+it to be caught; the Linux leg reports it as scoped away rather than counting it
+as caught, so a dead Windows guard still fails the PR.
 
 ## Two hard rules
 

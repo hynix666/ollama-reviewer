@@ -35,6 +35,7 @@ import dashpage  # noqa: E402
 from pidutil import pid_alive  # noqa: E402  one home: selftest's marker recovery shares it
 import mutation_marker  # noqa: E402  read-only marker state for dashboard_status
 from gh_runs import ci_runs  # noqa: E402  GitHub Actions via gh CLI, one home
+import mutverdict  # noqa: E402  the mutate verdict: child + wording, one home
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_OUT = os.path.join(ROOT, ".freebuff", "preview", "dashboard.html")
@@ -94,21 +95,6 @@ def server_state():
         return False, 0
 
 
-def mutation_result():
-    """Run the mutation registry; (total, all_caught, note) - note = no verdict."""
-    argv = [sys.executable, os.path.join("scripts", "selftest.py"), "--mutate"]
-    out = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True)
-    text = out.stdout + out.stderr
-    m = re.search(r"all (\d+) mutations caught", text)
-    if m:
-        return int(m.group(1)), True, None
-    m = re.search(r"(\d+) of (\d+) mutations NOT caught", text)
-    if m:
-        return int(m.group(2)), False, None
-    return 0, False, _degradation_note("the mutation registry run", out.returncode,
-                                       out.stdout, out.stderr)
-
-
 def commits(n=10):
     lines = sh(["git", "log", "--oneline", "-%d" % n]).splitlines()
     return [(h[:7], dashpage.E(s)) for h, _, s in (ln.partition(" ") for ln in lines)]
@@ -129,13 +115,16 @@ def gather(live):
     """Collect everything the page shows. One call, one honest snapshot."""
     rows, _summary, rows_note = selftest_rows(live)
     up, n_models = server_state()
-    mut_total, mut_ok, mut_note = mutation_result()
+    mut, mut_note = mutverdict.run()
     ci, ci_note = ci_runs()
     return {
         "live": live, "rows": rows, "up": up, "n_models": n_models,
-        "mut_total": mut_total, "mut_ok": mut_ok, "ci": ci, "ci_note": ci_note,
+        "mut_ok": mut["mut_ok"], "mut_total": mut["mut_total"],
+        "mut_caught": mut["mut_caught"], "mut_scoped": mut["mut_scoped"],
+        "mut_scope": mut["mut_scope"], "mut_note": mut_note,
+        "ci": ci, "ci_note": ci_note,
         "mods": modules(), "commits": commits(), "marker": mutation_marker.status(),
-        "rows_note": rows_note, "mut_note": mut_note,
+        "rows_note": rows_note,
         "tree": "%d uncommitted change(s)" % tree_state() if tree_state() else "clean",
     }
 

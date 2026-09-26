@@ -35,6 +35,27 @@ jobs:
     permissions:
       contents: read
     strategy:
+      # Runner images are pinned, never -latest: a floating label retargets
+      # every workflow at once, mid-flight, with no PR to review - the
+      # ubuntu-latest move to Ubuntu 26 lands 2026-10-19 that way. This repo
+      # has already paid for it once: Python 3.8 builds stopped existing when
+      # ubuntu-latest reached 24.04, which is why the 3.8 leg sits on 22.04.
+      # Pinning costs no patches - GitHub keeps a supported image updated in
+      # place - it costs owed maintenance, and that is what the vocabulary in
+      # selftest's "ci: runner images pinned to known labels" is for: a typo, a
+      # retired label or a new -latest fails the suite instead of reaching CI.
+      # Upgrade a pin when the migration is reviewed, not when the label moves
+      # under us (ubuntu-26.04 is already offered; ubuntu-latest still
+      # resolves to ubuntu-24.04, so that is today's pin).
+      #
+      # windows-latest currently resolves to the windows-2025-vs2026 image;
+      # the pin is windows-2025, the OS-level label, because this suite has no
+      # Visual Studio dependency and the OS label outlives preview variants.
+      # macos-latest resolves to macos-26-arm64, which the macos-26 label asks
+      # for. The pins were read off the 2026-09-26 run's own job logs (each
+      # job's "Runner Image" group names the image it got) and GitHub's
+      # GitHub-hosted runners reference, so they freeze what is proven today
+      # rather than guessing.
       fail-fast: false
       matrix:
         # 3.8 pinned to ubuntu-22.04: actions/python-versions does not ship a
@@ -43,11 +64,11 @@ jobs:
         # suite is skipped on 3.8 - three other interpreters already run it.
         include:
           - { os: ubuntu-22.04, python: "3.8" }
-          - { os: ubuntu-latest, python: "3.9" }
-          - { os: ubuntu-latest, python: "3.11" }
-          - { os: ubuntu-latest, python: "3.13" }
-          - { os: windows-latest, python: "3.13" }
-          - { os: macos-latest, python: "3.13" }
+          - { os: ubuntu-24.04, python: "3.9" }
+          - { os: ubuntu-24.04, python: "3.11" }
+          - { os: ubuntu-24.04, python: "3.13" }
+          - { os: windows-2025, python: "3.13" }
+          - { os: macos-26, python: "3.13" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -68,7 +89,7 @@ jobs:
         if: matrix.python != '3.8'
         run: python scripts/selftest.py --offline
 
-  # Meta-verification, not another test run: --mutate applies each of the 24
+  # Meta-verification, not another test run: --mutate applies each of the 25
   # registry mutations in turn, requires the checks named for it to fail, then
   # restores the source byte-exact. A green run proves the suite still catches
   # the regressions it claims to, so guard decay - a check weakened, an anchor
@@ -77,12 +98,13 @@ jobs:
   # so a red job means lost coverage, not a pre-existing break. All mutations
   # run offline, so this needs no server, no network, and no token grant.
   #
-  # Two operating systems, because a guard can decay on only one of them:
-  # paths, drives and shell semantics differ on Windows - the workspace and
-  # the temp dir sit on different drives there, a shape the journal-heal check
-  # only ever meets on Windows - so a mutation still caught on Linux but
-  # silently missed on Windows fails CI here instead of shipping a guard that
-  # is weaker than its registry entry claims.
+  # One entry - the journal-heal cross-drive fallback - is declared
+  # windows-only: drive-relative paths exist nowhere else, so the ubuntu leg
+  # reports it as scoped away rather than counting it as caught, and the
+  # windows leg is what requires it to be caught. That is the point of the
+  # second operating system: a guard can be weaker on one platform, and a
+  # mutation still caught on Linux but silently missed on Windows fails CI
+  # here instead of shipping a guard that is weaker than its entry claims.
   mutation-guards:
     name: mutation guards have teeth · ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -98,7 +120,7 @@ jobs:
       # when the other platform is also red.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-2025]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -119,7 +141,7 @@ jobs:
   # framing/lifecycle regression shows up as its own red signal.
   mcp-stdio:
     name: mcp stdio end to end
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Pure compute: spawns the server, drives JSON-RPC, runs no git commands
     # against GitHub. none means the job's token is inert. (If this repo ever
     # goes private, checkout needs contents: read here too.)
@@ -140,7 +162,7 @@ jobs:
 
   installers:
     name: installer syntax
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Syntax checks only - bash -n, a PowerShell parse, a grep. The token is
     # inert (same private-repo caveat as mcp-stdio if checkout ever needs
     # contents: read).
