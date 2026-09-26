@@ -76,14 +76,29 @@ jobs:
   # a local --mutate run that may never happen. The baseline suite runs first,
   # so a red job means lost coverage, not a pre-existing break. All mutations
   # run offline, so this needs no server, no network, and no token grant.
+  #
+  # Two operating systems, because a guard can decay on only one of them:
+  # paths, drives and shell semantics differ on Windows - the workspace and
+  # the temp dir sit on different drives there, a shape the journal-heal check
+  # only ever meets on Windows - so a mutation still caught on Linux but
+  # silently missed on Windows fails CI here instead of shipping a guard that
+  # is weaker than its registry entry claims.
   mutation-guards:
-    name: mutation guards have teeth
-    runs-on: ubuntu-latest
+    name: mutation guards have teeth · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     # Pure compute: mutates and restores working-tree files only, runs no git
     # commands against GitHub. none means the job's token is inert. (If this
     # repo ever goes private, checkout needs contents: read here too.)
     permissions:
       contents: none
+    strategy:
+      # Same interpreter on both legs: the OS is the only variable, so one red
+      # leg names the platform rather than a version interaction. Neither leg
+      # cancels the other - a platform-specific miss must stay visible even
+      # when the other platform is also red.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

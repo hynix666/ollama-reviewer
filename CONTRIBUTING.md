@@ -54,8 +54,9 @@ file's counts drift.
 
 CI runs `--offline` across Python 3.9–3.13 on Linux, Windows and macOS, byte-compiles
 the sources on Python 3.8 (the floor badge, not the suite), applies the mutation
-registry with `--mutate` so guard decay fails the PR, and syntax-checks both
-installers. All jobs must pass before a merge.
+registry with `--mutate` on both Linux and Windows so guard decay fails the PR
+on whichever platform it bites, and syntax-checks both installers. All jobs must
+pass before a merge.
 
 ## Two hard rules
 
